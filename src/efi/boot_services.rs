@@ -9,6 +9,7 @@
 
 use super::crc32::crc32_ieee;
 use super::protocol_db;
+use super::protocols::{EfiLoadedImageProtocol, LOADED_IMAGE_PROTOCOL_GUID};
 use super::types::*;
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -25,6 +26,9 @@ pub type InstallProtocolInterfaceFn =
     extern "C" fn(*mut EfiHandle, *const EfiGuid, u32, *mut c_void) -> EfiStatus;
 pub type HandleProtocolFn = extern "C" fn(EfiHandle, *const EfiGuid, *mut *mut c_void) -> EfiStatus;
 pub type LocateProtocolFn = extern "C" fn(*const EfiGuid, *mut c_void, *mut *mut c_void) -> EfiStatus;
+pub type LoadImageFn =
+    extern "C" fn(u8, EfiHandle, *mut c_void, *mut c_void, usize, *mut EfiHandle) -> EfiStatus;
+pub type StartImageFn = extern "C" fn(EfiHandle, *mut usize, *mut *mut u16) -> EfiStatus;
 pub type StallFn = extern "C" fn(usize) -> EfiStatus;
 pub type CopyMemFn = extern "C" fn(*mut c_void, *const c_void, usize);
 pub type SetMemFn = extern "C" fn(*mut c_void, usize, u8);
@@ -65,8 +69,8 @@ pub struct BootServices {
     pub locate_device_path: StubFn,
     pub install_configuration_table: StubFn,
 
-    pub load_image: StubFn,
-    pub start_image: StubFn,
+    pub load_image: LoadImageFn,
+    pub start_image: StartImageFn,
     pub exit: StubFn,
     pub unload_image: StubFn,
     pub exit_boot_services: StubFn,
@@ -108,6 +112,30 @@ pub fn set_framebuffer_region(base: u64, size: u64) {
 }
 
 static CURRENT_TPL: AtomicUsize = AtomicUsize::new(4); // TPL_APPLICATION
+
+// LoadImage/StartImage state. EFI_LOADED_IMAGE_PROTOCOL doesn't carry
+// an entry-point field (real firmwares track that internally too), so
+// ENTRY_POINTS is a parallel table keyed by the same handle index
+// protocol_db uses -- both arrays are sized to protocol_db::MAX_HANDLES
+// so the indices always line up.
+const EMPTY_LOADED_IMAGE: EfiLoadedImageProtocol = EfiLoadedImageProtocol {
+    revision: 0x1000,
+    parent_handle: core::ptr::null_mut(),
+    system_table: core::ptr::null_mut(),
+    device_handle: core::ptr::null_mut(),
+    file_path: core::ptr::null_mut(),
+    reserved: core::ptr::null_mut(),
+    load_options_size: 0,
+    load_options: core::ptr::null_mut(),
+    image_base: core::ptr::null_mut(),
+    image_size: 0,
+    image_code_type: EFI_LOADER_CODE,
+    image_data_type: EFI_LOADER_DATA,
+    unload: None,
+};
+static mut LOADED_IMAGE_PROTOCOLS: [EfiLoadedImageProtocol; protocol_db::MAX_HANDLES] =
+    [EMPTY_LOADED_IMAGE; protocol_db::MAX_HANDLES];
+static mut ENTRY_POINTS: [u64; protocol_db::MAX_HANDLES] = [0; protocol_db::MAX_HANDLES];
 
 extern "C" fn raise_tpl(new_tpl: usize) -> usize {
     // Bookkeeping only -- doesn't actually mask interrupts by
@@ -281,6 +309,76 @@ extern "C" fn calculate_crc32(data: *const c_void, data_size: usize, crc32: *mut
     EFI_SUCCESS
 }
 
+/// Loads a PE32+ AArch64 EFI application already sitting in memory
+/// (`source_buffer`/`source_size`) -- there's no device-path support,
+/// so `device_path` is accepted but unused; every caller so far loads
+/// straight from a buffer FAT32 already read off the SD card.
+extern "C" fn load_image(
+    _boot_policy: u8,
+    parent_image_handle: EfiHandle,
+    _device_path: *mut c_void,
+    source_buffer: *mut c_void,
+    source_size: usize,
+    image_handle: *mut EfiHandle,
+) -> EfiStatus {
+    if source_buffer.is_null() || image_handle.is_null() || source_size == 0 {
+        return EFI_INVALID_PARAMETER;
+    }
+    let data = unsafe { core::slice::from_raw_parts(source_buffer as *const u8, source_size) };
+
+    let loaded = match crate::pe::load(data) {
+        Ok(l) => l,
+        Err(_) => return EFI_UNSUPPORTED,
+    };
+
+    let Some(index) = protocol_db::find_or_create_handle(core::ptr::null_mut()) else {
+        return EFI_OUT_OF_RESOURCES;
+    };
+    let handle = protocol_db::handle_for_index(index);
+
+    let li_ptr = core::ptr::addr_of_mut!(LOADED_IMAGE_PROTOCOLS);
+    let ep_ptr = core::ptr::addr_of_mut!(ENTRY_POINTS);
+    unsafe {
+        (*li_ptr)[index] = EMPTY_LOADED_IMAGE;
+        (*li_ptr)[index].parent_handle = parent_image_handle;
+        (*li_ptr)[index].system_table = core::ptr::addr_of_mut!(super::system_table::SYSTEM_TABLE);
+        (*li_ptr)[index].image_base = loaded.image_base as *mut c_void;
+        (*li_ptr)[index].image_size = loaded.image_size;
+        (*ep_ptr)[index] = loaded.entry_point;
+    }
+
+    let interface = unsafe { core::ptr::addr_of_mut!((*li_ptr)[index]) as *mut c_void };
+    if !protocol_db::install(index, LOADED_IMAGE_PROTOCOL_GUID, interface) {
+        return EFI_OUT_OF_RESOURCES;
+    }
+
+    unsafe { *image_handle = handle };
+    EFI_SUCCESS
+}
+
+/// Calls straight into the loaded image's entry point with
+/// `(ImageHandle, SystemTable*)`, per the EFI calling convention --
+/// on AArch64 that's just plain AAPCS64, so this is a direct call
+/// through a transmuted function pointer, no ABI shim needed.
+extern "C" fn start_image(
+    image_handle: EfiHandle,
+    _exit_data_size: *mut usize,
+    _exit_data: *mut *mut u16,
+) -> EfiStatus {
+    let Some(index) = protocol_db::index_of(image_handle) else {
+        return EFI_INVALID_PARAMETER;
+    };
+    let entry = unsafe { (*core::ptr::addr_of!(ENTRY_POINTS))[index] };
+    if entry == 0 {
+        return EFI_INVALID_PARAMETER;
+    }
+
+    let entry_fn: extern "C" fn(EfiHandle, *mut super::system_table::SystemTable) -> EfiStatus =
+        unsafe { core::mem::transmute(entry as usize) };
+    let st = core::ptr::addr_of_mut!(super::system_table::SYSTEM_TABLE);
+    entry_fn(image_handle, st)
+}
+
 extern "C" fn stub() -> EfiStatus {
     EFI_UNSUPPORTED
 }
@@ -320,8 +418,8 @@ pub static mut BOOT_SERVICES: BootServices = BootServices {
     locate_device_path: stub,
     install_configuration_table: stub,
 
-    load_image: stub,
-    start_image: stub,
+    load_image,
+    start_image,
     exit: stub,
     unload_image: stub,
     exit_boot_services: stub,

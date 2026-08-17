@@ -146,6 +146,56 @@ where the layout code puts them, and the existing keystroke-driven
 interaction tests (System Info, Boot from SD with a real FAT32 image)
 re-verified against the new code with identical, correct output.
 
+**Milestone 10 (done):** PE/COFF loader (`pe.rs`) + real `LoadImage`/
+`StartImage` (`boot_services.rs`) + `EFI_LOADED_IMAGE_PROTOCOL`
+(`efi/protocols.rs`). "Boot from SD" now looks for a `.EFI` file on
+the volume and actually loads and runs it: parses the DOS/COFF/
+Optional headers, copies each section to its RVA in a freshly
+allocated image (via the real `AllocatePages`), and -- since our
+allocator never lands an image at its preferred `ImageBase` -- applies
+`IMAGE_REL_BASED_DIR64` base relocations before calling the entry
+point with `(ImageHandle, SystemTable*)`, exactly the EFI calling
+convention (which on AArch64 is just plain AAPCS64, no ABI shim
+needed).
+
+No `aarch64-unknown-uefi` Rust target was available offline to build a
+real reference `.efi`, so the test binary was built by hand instead,
+in two independently-checkable pieces: the actual AArch64 machine code
+was assembled through the same `global_asm!` pipeline the firmware
+itself already uses (so it's real, verifier-checked code, not
+hand-encoded bytes), while the PE32+ container around it was
+constructed field-by-field in a small script and independently
+confirmed well-formed by the system `file` command before Ferro ever
+saw it. The test payload embeds one self-referential pointer, patched
+in the file to hold the value it *would* have had if linked at its
+declared `ImageBase` -- making relocation not just exercised but
+required for the test to print the right answer.
+
+Found two real bugs this way, on the first run:
+- An off-by-24 offset error in the Optional Header parsing
+  (`NumberOfRvaAndSizes` and the data directory array both read from
+  the wrong offset) that made the relocation directory look empty, so
+  relocations were silently skipped -- caught because the printed
+  "relocated" pointer exactly matched the *pre*-relocation value
+  instead of the expected post-relocation address.
+- A calling-convention bug in the *test binary itself* (not Ferro):
+  nested `bl` calls in the hand-written entry stub clobbered the
+  return address in `x30` without saving it first, so the final `ret`
+  jumped back into the middle of the stub instead of back into Ferro
+  -- an infinite loop, caught immediately from the flood of blank
+  lines it produced.
+
+After both fixes: `LoadImage` returns a real handle, `HandleProtocol`
+fetches `EFI_LOADED_IMAGE_PROTOCOL` back and its `ImageBase`
+independently matches what `LoadImage` reported, and the test app
+(called through the real, relocated entry point) printed its own
+`ImageHandle` and `SystemTable` pointer arguments back over UART --
+both exactly matching Ferro's own values -- along with the relocated
+self-pointer, which exactly matched `load_base + RVA`, not the
+pre-relocation value. `StartImage` then correctly received
+`EFI_SUCCESS` back through a real `ret`, and the boot menu resumed
+normally afterward. Verified on both debug and release builds.
+
 ```
 $ ./scripts/run-qemu.sh
 Ferro UEFI
@@ -172,10 +222,12 @@ milestone 1: core0 -> EL1 -> UART online
 - `src/pm.rs` -- BCM2837 power management (watchdog reset).
 - `src/sd.rs` -- SDHCI SD card driver (see milestone 8's real-vs-emulated caveat).
 - `src/fat32.rs` -- read-only FAT32: mount, list root, read file by name.
+- `src/pe.rs` -- PE32+ (AArch64) loader: parse, load, base-relocate.
 - `src/efi/` -- UEFI Boot Services core:
   - `types.rs` -- EFI_STATUS, EFI_GUID, EFI_MEMORY_DESCRIPTOR, etc.
   - `memory.rs` -- physical page allocator + memory map builder.
   - `protocol_db.rs` -- fixed-capacity handle/protocol database.
+  - `protocols.rs` -- protocol structs installed on handles (EFI_LOADED_IMAGE_PROTOCOL so far).
   - `boot_services.rs` -- EFI_BOOT_SERVICES: real subset + spec-shaped stubs.
   - `system_table.rs` -- EFI_SYSTEM_TABLE.
   - `crc32.rs` -- CRC-32 shared by CalculateCrc32 and table header checksums.
@@ -252,13 +304,9 @@ sure this still happens before the first `bl` into Rust.
 
 ## Next milestones
 
-1. A PE/COFF loader + LoadImage/StartImage, so a real `.efi` binary can
-   actually run against the Boot Services table instead of only Ferro's
-   own smoke test calling through it -- FAT32 can already find and read
-   the file, this is "parse it as PE/COFF and jump in."
-2. UEFI Runtime Services + variable storage.
-3. USB (dwc2) + HID, so the menu can be driven from a real keyboard.
-4. Real Pi 3 hardware validation -- nothing here has touched physical
+1. UEFI Runtime Services + variable storage.
+2. USB (dwc2) + HID, so the menu can be driven from a real keyboard.
+3. Real Pi 3 hardware validation -- nothing here has touched physical
    hardware yet, and there are two known gaps waiting there: the
    pm.rs reset sequence (right code, unverified effect) and sd.rs's
    controller choice (right controller for QEMU, wrong one for the

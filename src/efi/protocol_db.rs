@@ -6,7 +6,7 @@
 use super::types::EfiGuid;
 use core::ffi::c_void;
 
-const MAX_HANDLES: usize = 32;
+pub const MAX_HANDLES: usize = 32;
 const MAX_PROTOCOLS_PER_HANDLE: usize = 8;
 
 #[derive(Clone, Copy)]
@@ -42,6 +42,16 @@ fn handle_to_index(handle: *mut c_void) -> Option<usize> {
 
 fn index_to_handle(index: usize) -> *mut c_void {
     (index + 1) as *mut c_void
+}
+
+/// Table index backing `handle`, if it's a live (in-use) handle.
+/// Public so callers that need to attach out-of-band state to a
+/// handle (LoadImage's entry-point table, for instance) can key it by
+/// the same index this database uses internally.
+pub fn index_of(handle: *mut c_void) -> Option<usize> {
+    let i = handle_to_index(handle)?;
+    let handles = core::ptr::addr_of!(HANDLES);
+    unsafe { (*handles)[i].in_use.then_some(i) }
 }
 
 /// Finds an existing handle's slot, or allocates a fresh one. Returns

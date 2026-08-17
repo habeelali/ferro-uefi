@@ -17,6 +17,7 @@ mod local_intc;
 mod mailbox;
 mod mmio;
 mod mmu;
+mod pe;
 mod pm;
 mod sd;
 mod timer;

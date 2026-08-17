@@ -9,6 +9,7 @@ pub mod boot_services;
 mod crc32;
 pub mod memory;
 pub mod protocol_db;
+pub mod protocols;
 pub mod system_table;
 pub mod types;
 

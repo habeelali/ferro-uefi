@@ -311,7 +311,9 @@ fn boot_from_sd(fb: &Framebuffer, uart: &mut Uart) {
         y += line_height(2);
     }
 
-    if count > 0 {
+    let efi_index = (0..count).find(|&i| &names[i][8..11] == b"EFI");
+
+    if efi_index.is_none() && count > 0 {
         let mut content = [0u8; 256];
         match fs.read_file(&card, &names[0], &mut content) {
             Ok(n) => {
@@ -329,8 +331,99 @@ fn boot_from_sd(fb: &Framebuffer, uart: &mut Uart) {
         }
     }
 
+    if let Some(i) = efi_index {
+        let name = core::str::from_utf8(&names[i]).unwrap_or("????????.???");
+        y += line_height(2);
+        fb.draw_text(CONTENT_X, y, "EFI APPLICATION FOUND:", 2, ACCENT);
+        y += line_height(2);
+        fb.draw_text(CONTENT_X + 20, y, name, 2, FG);
+        fb.flush();
+        writeln!(uart, "\n  EFI application found: {name}").ok();
+        boot_efi_app(fb, uart, &fs, &card, &names[i], y);
+    }
+
     fb.flush();
     wait_for_key(uart);
+}
+
+/// Reads a `.EFI` file into a static load buffer and runs it through
+/// the real EFI_BOOT_SERVICES table -- LoadImage (PE/COFF parse +
+/// relocate), HandleProtocol (fetch EFI_LOADED_IMAGE_PROTOCOL back to
+/// independently cross-check what LoadImage did), then StartImage
+/// (call the entry point with (ImageHandle, SystemTable*) and get its
+/// EFI_STATUS back).
+fn boot_efi_app(fb: &Framebuffer, uart: &mut Uart, fs: &Fat32, card: &Card, name: &[u8; 11], mut y: u32) {
+    use crate::efi::boot_services::BOOT_SERVICES;
+    use crate::efi::protocols::{EfiLoadedImageProtocol, LOADED_IMAGE_PROTOCOL_GUID};
+    use crate::efi::system_table::SYSTEM_TABLE;
+    use crate::efi::types::{EfiHandle, EFI_SUCCESS};
+    use core::ffi::c_void;
+
+    static mut LOAD_BUFFER: [u8; 65536] = [0; 65536];
+
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(LOAD_BUFFER) };
+    let n = match fs.read_file(card, name, buf) {
+        Ok(n) => n,
+        Err(e) => {
+            writeln!(uart, "  read_file failed: {e:?}").ok();
+            fb.draw_text(CONTENT_X + 20, y, "FAILED TO READ FILE FROM SD.", 2, ERROR);
+            return;
+        }
+    };
+    writeln!(uart, "  read {n} bytes from SD").ok();
+
+    let bs = unsafe { &*core::ptr::addr_of!(BOOT_SERVICES) };
+
+    let mut image_handle: EfiHandle = core::ptr::null_mut();
+    let status = (bs.load_image)(
+        0,
+        core::ptr::null_mut(),
+        core::ptr::null_mut(),
+        buf.as_mut_ptr() as *mut c_void,
+        n,
+        &mut image_handle,
+    );
+    writeln!(uart, "  LoadImage -> status=0x{status:x} handle={image_handle:p}").ok();
+    y += line_height(2);
+    if status != EFI_SUCCESS {
+        fb.draw_text(CONTENT_X + 20, y, "LOADIMAGE FAILED (SEE UART).", 2, ERROR);
+        return;
+    }
+    fb.draw_text(CONTENT_X + 20, y, "LOADIMAGE OK -- PE PARSED AND RELOCATED.", 2, FG);
+    fb.flush();
+    timer::sleep_ticks(LINE_DELAY_TICKS);
+
+    // Cross-check: fetch EFI_LOADED_IMAGE_PROTOCOL back via
+    // HandleProtocol, independent of whatever LoadImage told us
+    // directly, to prove the protocol database round-trips correctly
+    // for a real, freshly-loaded image.
+    let mut iface: *mut c_void = core::ptr::null_mut();
+    let status = (bs.handle_protocol)(image_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut iface);
+    if status == EFI_SUCCESS && !iface.is_null() {
+        let li = unsafe { &*(iface as *const EfiLoadedImageProtocol) };
+        writeln!(
+            uart,
+            "  HandleProtocol(LOADED_IMAGE) -> base={:p} size={}",
+            li.image_base, li.image_size
+        )
+        .ok();
+    }
+
+    writeln!(
+        uart,
+        "  SystemTable @ {:p} (should match S: printed by the app below)",
+        core::ptr::addr_of!(SYSTEM_TABLE)
+    )
+    .ok();
+
+    y += line_height(2);
+    fb.draw_text(CONTENT_X + 20, y, "STARTING IMAGE (OUTPUT BELOW IS FROM THE APP ITSELF):", 2, DIM);
+    fb.flush();
+
+    writeln!(uart, "  --- entering StartImage ---").ok();
+    let mut exit_data_size: usize = 0;
+    let status = (bs.start_image)(image_handle, &mut exit_data_size, core::ptr::null_mut());
+    writeln!(uart, "\n  --- back from StartImage: status=0x{status:x} ---").ok();
 }
 
 fn select(fb: &Framebuffer, uart: &mut Uart, s: &MenuState) {
