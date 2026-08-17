@@ -17,6 +17,7 @@ const UART_CR: usize = UART0_BASE + 0x30;
 const UART_ICR: usize = UART0_BASE + 0x44;
 
 const FR_TXFF: u32 = 1 << 5;
+const FR_RXFE: u32 = 1 << 4;
 
 pub struct Uart;
 
@@ -56,6 +57,17 @@ impl Uart {
         unsafe {
             while mmio::read(UART_FR) & FR_TXFF != 0 {}
             mmio::write(UART_DR, c as u32);
+        }
+    }
+
+    /// Non-blocking receive: `None` if nothing's waiting.
+    pub fn getc(&mut self) -> Option<u8> {
+        unsafe {
+            if mmio::read(UART_FR) & FR_RXFE != 0 {
+                None
+            } else {
+                Some(mmio::read(UART_DR) as u8)
+            }
         }
     }
 

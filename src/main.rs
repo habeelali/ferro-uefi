@@ -6,10 +6,19 @@
 #![no_std]
 #![no_main]
 
+mod cache;
 mod exceptions;
+mod font;
+mod framebuffer;
+mod irq;
+mod local_intc;
+mod mailbox;
 mod mmio;
 mod mmu;
+mod pm;
+mod timer;
 mod uart;
+mod ui;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -28,8 +37,39 @@ pub extern "C" fn ferro_main() -> ! {
     writeln!(uart, "milestone 1: core0 -> EL1 -> UART online").ok();
     writeln!(uart, "milestone 3: MMU enabled, RAM + device regions identity-mapped").ok();
 
-    loop {
-        unsafe { core::arch::asm!("wfe") };
+    timer::init(100); // 100 Hz tick
+    unsafe {
+        local_intc::enable_core0_timer_irq();
+        core::arch::asm!("msr daifclr, #2"); // unmask IRQ
+    }
+    timer::sleep_ticks(100); // ~1s, proves IRQs are actually being delivered
+    writeln!(
+        uart,
+        "milestone 4: timer/IRQ online via BCM2836 local block ({} ticks in ~1s)",
+        timer::ticks()
+    )
+    .ok();
+
+    match framebuffer::init(800, 600, 32) {
+        Some(fb) => {
+            writeln!(
+                uart,
+                "milestone 5: framebuffer {}x{} pitch={} @ {:p}",
+                fb.width, fb.height, fb.pitch, fb.ptr
+            )
+            .ok();
+
+            ui::splash(&fb);
+            timer::sleep_ticks(150); // ~1.5s
+            writeln!(uart, "milestone 6: entering boot menu (serial console input)").ok();
+            ui::run(&fb, &mut uart);
+        }
+        None => {
+            writeln!(uart, "milestone 5: framebuffer allocation FAILED").ok();
+            loop {
+                unsafe { core::arch::asm!("wfe") };
+            }
+        }
     }
 }
 

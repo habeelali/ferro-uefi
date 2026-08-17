@@ -16,7 +16,7 @@ use core::arch::asm;
 const BLOCK_2M: u64 = 0x0020_0000;
 
 const PERIPHERAL_BASE: u64 = crate::mmio::PERIPHERAL_BASE as u64;
-const ARM_LOCAL_BASE: u64 = 0x4000_0000;
+const ARM_LOCAL_BASE: u64 = crate::mmio::LOCAL_BASE as u64;
 
 const MT_NORMAL: u64 = 0;
 const MT_DEVICE_NGNRNE: u64 = 1;

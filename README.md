@@ -33,6 +33,42 @@ range (0x9000_0000) now reports a genuine "Translation fault, level 1"
 faults *because of the page tables*, not because nothing answered the
 bus.
 
+**Milestone 4 (done):** ARM generic timer (CNTP) + interrupts. BCM2837
+has no GIC -- interrupts route through the SoC's per-core "local"
+control block instead (Broadcom calls it QA7); see `local_intc.rs`.
+`vectors.s` gained a real IRQ path (full register save/restore, `eret`
+to resume) alongside the existing fatal-only paths. Verified: armed a
+100 Hz tick and slept on it, and got exactly 100 ticks in ~1s --
+interrupts are actually firing and resuming correctly, not just
+counting in a busy loop.
+
+**Milestone 5 (done):** Framebuffer via the VideoCore property mailbox
+(`mailbox.rs`, `framebuffer.rs`). Getting a buffer from the GPU means
+crossing a cache/address boundary the CPU's MMU doesn't cover on its
+own: the message buffer and framebuffer both need explicit clean+
+invalidate (`cache.rs`) since the GPU doesn't snoop our D-cache, and
+addresses exchanged with the GPU need its bus-address aliasing (request
+via the `0xC000_0000` uncached alias, strip the alias bits back off
+addresses it returns). Verified by capturing a real QEMU screendump and
+checking exact pixel values at and outside a filled rectangle's
+boundary -- not just that the mailbox call returned success.
+
+**Milestone 6 (done):** Splash screen and interactive boot menu
+(`font.rs`, `ui.rs`). No USB HID driver exists yet, so navigation is
+over the UART serial console (arrow keys or j/k, Enter to select)
+while the same UI renders to the framebuffer simultaneously. Items:
+Boot from SD (reports not-yet-implemented -- true, that's milestone 8),
+System Info (reads MIDR_EL1/CNTFRQ_EL0/CurrentEL for real and prints
+them), Reboot (issues the real BCM283x watchdog-reset sequence via
+`pm.rs`). Verified by driving QEMU's serial console with actual
+keystrokes end-to-end -- not just rendering a static screen -- and
+confirmed System Info's output is genuine hardware state (MIDR_EL1
+decoded to a real Cortex-A53 ID, CNTFRQ_EL0 read 62.5MHz matching the
+Pi 3's known generic timer frequency). One honest gap: Reboot sends the
+correct real-hardware reset sequence, but QEMU's `bcm2835-powermgt`
+model doesn't act on it, so nothing actually restarts under QEMU --
+untested whether it resets real hardware.
+
 No UEFI services yet; that's the next layer to build.
 
 ```
@@ -50,6 +86,15 @@ milestone 1: core0 -> EL1 -> UART online
   (kind, ESR, ELR, FAR, SPSR) to `rust_exception_handler`.
 - `src/exceptions.rs` -- decodes and prints fatal exceptions, then halts.
 - `src/mmu.rs` -- stage-1 page tables (identity map) and MMU enable.
+- `src/local_intc.rs` -- BCM2836 local (QA7) per-core interrupt routing.
+- `src/timer.rs` -- ARM generic timer (CNTP), tick counter.
+- `src/irq.rs` -- IRQ dispatch (timer only, so far).
+- `src/cache.rs` -- D-cache clean+invalidate for GPU-shared buffers.
+- `src/mailbox.rs` -- VideoCore property-tag mailbox protocol.
+- `src/framebuffer.rs` -- framebuffer allocation + pixel/rect/text drawing.
+- `src/font.rs` -- 5x7 bitmap font (just the glyphs the UI uses).
+- `src/ui.rs` -- splash screen + boot menu (UART-driven navigation).
+- `src/pm.rs` -- BCM2837 power management (watchdog reset).
 - `src/main.rs` -- `ferro_main`, panic handler.
 - `src/mmio.rs` -- BCM2837 peripheral base addresses, volatile MMIO helpers.
 - `src/uart.rs` -- PL011 UART0 driver (+ the GPIO alt-function setup it needs).
@@ -110,8 +155,7 @@ sure this still happens before the first `bl` into Rust.
 
 ## Next milestones
 
-1. Timer / mailbox / GIC bring-up.
-2. UEFI Boot Services core (memory map, protocol database).
-3. SD/MMC + FAT32, so we can load an actual OS.
-4. UEFI Runtime Services + variable storage.
-5. Setup UI, boot manager.
+1. UEFI Boot Services core (memory map, protocol database).
+2. SD/MMC + FAT32, so "Boot from SD" in the menu can do something real.
+3. UEFI Runtime Services + variable storage.
+4. USB (dwc2) + HID, so the menu can be driven from a real keyboard.
