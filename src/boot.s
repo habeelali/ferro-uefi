@@ -65,6 +65,13 @@ el1_entry:
     msr     cpacr_el1, x0
     isb
 
+    // Install the exception vector table before any Rust code runs, so
+    // a fault anywhere below here is reported instead of silently
+    // hanging (see vectors.s).
+    ldr     x0, =vector_table_el1
+    msr     vbar_el1, x0
+    isb
+
     // Stack for core 0.
     ldr     x0, =__stack_top
     mov     sp, x0

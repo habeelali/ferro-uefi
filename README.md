@@ -15,6 +15,13 @@ instruction executed on the ARM core.
 
 **Milestone 1 (done):** reset -> park secondary cores -> drop
 EL3/EL2 -> EL1 -> zero `.bss` -> UART0 online -> Rust banner printed.
+
+**Milestone 2 (done):** EL1 exception vector table installed before any
+Rust code runs. Every fault (data/instruction abort, undefined
+instruction, alignment fault, ...) now prints its kind, decoded EC,
+ESR/ELR/FAR/SPSR, and halts -- instead of silently hanging. Verified by
+deliberately reading an unmapped address and confirming the report.
+
 No UEFI services yet; that's the next layer to build.
 
 ```
@@ -27,7 +34,10 @@ milestone 1: core0 -> EL1 -> UART online
 ## Layout
 
 - `src/boot.s` -- reset entry, core parking, EL3->EL2->EL1 drop, FP/SIMD
-  enable, stack + `.bss` setup, hand-off to Rust.
+  enable, VBAR_EL1 install, stack + `.bss` setup, hand-off to Rust.
+- `src/vectors.s` -- EL1 exception vector table; each vector forwards
+  (kind, ESR, ELR, FAR, SPSR) to `rust_exception_handler`.
+- `src/exceptions.rs` -- decodes and prints fatal exceptions, then halts.
 - `src/main.rs` -- `ferro_main`, panic handler.
 - `src/mmio.rs` -- BCM2837 peripheral base addresses, volatile MMIO helpers.
 - `src/uart.rs` -- PL011 UART0 driver (+ the GPIO alt-function setup it needs).
@@ -88,10 +98,10 @@ sure this still happens before the first `bl` into Rust.
 
 ## Next milestones
 
-1. Exception vector table (so future traps are visible instead of silent).
-2. MMU + page tables (identity map RAM + device regions).
-3. Timer / mailbox / GIC bring-up.
-4. UEFI Boot Services core (memory map, protocol database).
-5. SD/MMC + FAT32, so we can load an actual OS.
-6. UEFI Runtime Services + variable storage.
-7. Setup UI, boot manager.
+1. MMU + page tables (identity map RAM + device regions) -- now that
+   faults are diagnosable, this is the next thing likely to produce them.
+2. Timer / mailbox / GIC bring-up.
+3. UEFI Boot Services core (memory map, protocol database).
+4. SD/MMC + FAT32, so we can load an actual OS.
+5. UEFI Runtime Services + variable storage.
+6. Setup UI, boot manager.

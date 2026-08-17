@@ -6,6 +6,7 @@
 #![no_std]
 #![no_main]
 
+mod exceptions;
 mod mmio;
 mod uart;
 
@@ -13,6 +14,7 @@ use core::fmt::Write;
 use core::panic::PanicInfo;
 
 core::arch::global_asm!(include_str!("boot.s"));
+core::arch::global_asm!(include_str!("vectors.s"));
 
 #[no_mangle]
 pub extern "C" fn ferro_main() -> ! {
