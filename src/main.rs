@@ -18,6 +18,7 @@ mod mailbox;
 mod mmio;
 mod mmu;
 mod pe;
+mod persist;
 mod pm;
 mod sd;
 mod timer;

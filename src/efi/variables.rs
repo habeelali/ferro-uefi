@@ -1,8 +1,9 @@
 //! UEFI variable storage: a fixed-capacity, in-RAM store backing
-//! GetVariable/SetVariable/GetNextVariableName. No persistence across
-//! reboots yet -- there's no flash/NVRAM driver, so this is exactly
-//! as durable as the rest of RAM and no more. That's the honest first
-//! slice; persistence is a real follow-up once something needs it.
+//! GetVariable/SetVariable/GetNextVariableName. Cross-reboot
+//! persistence isn't automatic -- there's no flash/NVRAM driver -- but
+//! `serialize`/`deserialize` here plus `persist.rs`'s SD-card backing
+//! give it real, if manually-triggered, durability. See persist.rs
+//! for where the bytes actually live.
 
 use super::types::EfiGuid;
 
@@ -184,4 +185,111 @@ pub fn storage_info() -> (u64, u64, u64) {
     };
     let total = (MAX_VARIABLES * MAX_DATA_LEN) as u64;
     (total, total - used as u64, MAX_DATA_LEN as u64)
+}
+
+const MAGIC: &[u8; 4] = b"FVR1";
+
+/// Packs every in-use variable into `buf` (magic, count, then each
+/// variable's name/guid/attributes/data). Returns the byte count
+/// written, or None if `buf` is too small for the current contents.
+pub fn serialize(buf: &mut [u8]) -> Option<usize> {
+    if buf.len() < 8 {
+        return None;
+    }
+    buf[0..4].copy_from_slice(MAGIC);
+    let mut pos = 8usize; // count patched in at the end
+
+    let vars = core::ptr::addr_of!(VARS);
+    let mut count = 0u32;
+    unsafe {
+        for v in (*vars).iter() {
+            if !v.in_use {
+                continue;
+            }
+            let entry_len = 2 + v.name_len * 2 + 16 + 4 + 4 + v.data_len;
+            if pos + entry_len > buf.len() {
+                return None;
+            }
+            buf[pos..pos + 2].copy_from_slice(&(v.name_len as u16).to_le_bytes());
+            pos += 2;
+            for &unit in &v.name[..v.name_len] {
+                buf[pos..pos + 2].copy_from_slice(&unit.to_le_bytes());
+                pos += 2;
+            }
+            buf[pos..pos + 4].copy_from_slice(&v.guid.data1.to_le_bytes());
+            pos += 4;
+            buf[pos..pos + 2].copy_from_slice(&v.guid.data2.to_le_bytes());
+            pos += 2;
+            buf[pos..pos + 2].copy_from_slice(&v.guid.data3.to_le_bytes());
+            pos += 2;
+            buf[pos..pos + 8].copy_from_slice(&v.guid.data4);
+            pos += 8;
+            buf[pos..pos + 4].copy_from_slice(&v.attributes.to_le_bytes());
+            pos += 4;
+            buf[pos..pos + 4].copy_from_slice(&(v.data_len as u32).to_le_bytes());
+            pos += 4;
+            buf[pos..pos + v.data_len].copy_from_slice(&v.data[..v.data_len]);
+            pos += v.data_len;
+            count += 1;
+        }
+    }
+
+    buf[4..8].copy_from_slice(&count.to_le_bytes());
+    Some(pos)
+}
+
+/// Loads variables packed by `serialize` and merges them into the
+/// live store (same dedup/overwrite rules as `set`). Returns the
+/// number of variables loaded, or None if `buf` doesn't start with
+/// our magic (not our data, or genuinely empty/unwritten storage).
+pub fn deserialize(buf: &[u8]) -> Option<usize> {
+    if buf.len() < 8 || &buf[0..4] != MAGIC {
+        return None;
+    }
+    let count = u32::from_le_bytes(buf[4..8].try_into().unwrap()) as usize;
+    let mut pos = 8usize;
+    let mut loaded = 0usize;
+
+    for _ in 0..count {
+        if pos + 2 > buf.len() {
+            break;
+        }
+        let name_len = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        if name_len > MAX_NAME_UNITS || pos + name_len * 2 > buf.len() {
+            break;
+        }
+        let mut name = [0u16; MAX_NAME_UNITS];
+        for i in 0..name_len {
+            name[i] = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
+            pos += 2;
+        }
+        if pos + 16 + 4 + 4 > buf.len() {
+            break;
+        }
+        let guid = EfiGuid {
+            data1: u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()),
+            data2: u16::from_le_bytes(buf[pos + 4..pos + 6].try_into().unwrap()),
+            data3: u16::from_le_bytes(buf[pos + 6..pos + 8].try_into().unwrap()),
+            data4: buf[pos + 8..pos + 16].try_into().unwrap(),
+        };
+        pos += 16;
+        let attributes = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap());
+        pos += 4;
+        let data_len = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if data_len > MAX_DATA_LEN || pos + data_len > buf.len() {
+            break;
+        }
+        let data = &buf[pos..pos + data_len];
+        pos += data_len;
+
+        // Build a NUL-terminated name buffer to feed set()'s pointer-based API.
+        let mut name_nt = [0u16; MAX_NAME_UNITS + 1];
+        name_nt[..name_len].copy_from_slice(&name[..name_len]);
+        if set(name_nt.as_ptr(), &guid, attributes, data).is_ok() {
+            loaded += 1;
+        }
+    }
+    Some(loaded)
 }

@@ -247,6 +247,35 @@ verified stays in `boot_services.rs`; only the throwaway test call
 was reverted. Full regression (menu, SD/FAT32, PE loader) re-verified
 clean afterward on both debug and release builds.
 
+**Milestone 13 (done):** real SD **writes** (`sd.rs`, CMD24) and
+genuine cross-reboot persistence for the variable store (`persist.rs`),
+without needing FAT32 write support at all. FAT32 volumes always
+reserve more sectors before the FAT tables than the four the spec
+actually uses (boot sector, FSInfo, and their conventional backups at
+sectors 6-7) -- mkfs.fat's default is 32 reserved sectors, leaving a
+wide, genuinely unused margin real FAT32 implementations never touch.
+`Fat32::private_scratch_region()` claims a conservative slice of that
+padding (starting at sector 16, verified against real `mkfs.fat`
+output rather than assumed) as private raw storage for a serialized
+variable-store blob. The boot menu gained "Save Variables to SD", and
+"Boot from SD" now auto-loads whatever was last saved, merging it into
+the live store.
+
+Verified about as thoroughly as this project gets: saved variables
+(set earlier by the Boot Services smoke test) on one QEMU boot,
+**independently** parsed the raw disk image's bytes at the exact
+scratch-region offset with a standalone Python script (outside Ferro
+entirely) and confirmed the magic, count, name, GUID, attributes, and
+value all matched exactly -- proof the real SDHCI write path (not just
+"looks plausible") put the right bytes in the right place. Then booted
+a **completely fresh QEMU process** against that same disk image and
+confirmed "Boot from SD" auto-loaded and correctly reported "1
+variable(s) merged" -- genuine state surviving a full, independent
+reboot, not just the same run. The no-prior-save case (fresh card,
+never written) was also verified to fail gracefully rather than
+misbehave. Full regression re-run clean afterward given how much of
+`sd.rs`'s shared command-sending code changed to add write support.
+
 ```
 $ ./scripts/run-qemu.sh
 Ferro UEFI
@@ -271,8 +300,9 @@ milestone 1: core0 -> EL1 -> UART online
 - `src/font.rs` -- 5x7 bitmap font (just the glyphs the UI uses).
 - `src/ui.rs` -- boot log, splash screen, boot menu (UART-driven navigation).
 - `src/pm.rs` -- BCM2837 power management (watchdog reset).
-- `src/sd.rs` -- SDHCI SD card driver (see milestone 8's real-vs-emulated caveat).
+- `src/sd.rs` -- SDHCI SD card driver, read+write (see milestone 8's real-vs-emulated caveat).
 - `src/fat32.rs` -- read-only FAT32: mount, list root, read file by name.
+- `src/persist.rs` -- variable-store save/load via FAT32's unused reserved sectors.
 - `src/pe.rs` -- PE32+ (AArch64) loader: parse, load, base-relocate.
 - `src/efi/` -- UEFI Boot Services core:
   - `types.rs` -- EFI_STATUS, EFI_GUID, EFI_MEMORY_DESCRIPTOR, etc.
@@ -358,9 +388,10 @@ sure this still happens before the first `bl` into Rust.
 ## Next milestones
 
 1. USB (dwc2) + HID, so the menu can be driven from a real keyboard.
-2. Persist the variable store across reboots (needs a flash/NVRAM
-   driver, or at minimum writing it to the SD card) -- currently
-   real but RAM-only.
+2. Automatic variable persistence (save on `SetVariable` with the
+   NON_VOLATILE attribute, rather than only via the explicit menu
+   item) and FAT32 write support, so saved state doesn't depend on a
+   private, non-standard corner of the reserved sectors.
 3. Real Pi 3 hardware validation -- nothing here has touched physical
    hardware yet, and there are two known gaps waiting there: the
    pm.rs reset sequence (right code, unverified effect) and sd.rs's

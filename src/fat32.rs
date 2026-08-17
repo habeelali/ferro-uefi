@@ -83,6 +83,23 @@ impl Fat32 {
             + self.num_fats as u32 * self.fat_size_sectors
     }
 
+    /// A safe range of otherwise-unused sectors within the reserved
+    /// area (before the FATs start) -- sectors 0 (boot sector), 1
+    /// (FSInfo), and 6-7 (their conventional backups) are spoken for,
+    /// but real FAT32 volumes always carry many more reserved sectors
+    /// than those four use (mkfs.fat's default is 32). Returns
+    /// (start_lba, sector_count) for whatever's safely free starting
+    /// at sector 16, or None if this volume's reserved area is too
+    /// small to have any margin there.
+    pub fn private_scratch_region(&self) -> Option<(u32, u32)> {
+        const START_OFFSET: u32 = 16;
+        let reserved = self.reserved_sectors as u32;
+        if reserved <= START_OFFSET {
+            return None;
+        }
+        Some((self.partition_start_lba + START_OFFSET, reserved - START_OFFSET))
+    }
+
     fn cluster_to_lba(&self, cluster: u32) -> u32 {
         self.first_data_sector() + (cluster - 2) * self.sectors_per_cluster as u32
     }

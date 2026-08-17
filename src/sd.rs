@@ -38,6 +38,7 @@ const REG_CAPABILITIES: usize = SD_BASE + 0x40;
 
 const INT_CMD_COMPLETE: u32 = 1 << 0;
 const INT_TRANSFER_COMPLETE: u32 = 1 << 1;
+const INT_BUFFER_WRITE_READY: u32 = 1 << 4;
 const INT_BUFFER_READ_READY: u32 = 1 << 5;
 const INT_ERROR_MASK: u32 = 0xFFFF_0000;
 
@@ -55,6 +56,13 @@ enum RespType {
     None,
     R2,
     R1, // covers R1/R1b/R3/R6/R7 -- same 48-bit-response wire format
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum DataDir {
+    None,
+    Read,
+    Write,
 }
 
 fn wait_while(timeout_ticks: u64, mut cond: impl FnMut() -> bool) -> Result<(), SdError> {
@@ -100,7 +108,7 @@ fn set_clock(target_hz: u64) -> Result<(), SdError> {
     Ok(())
 }
 
-fn send_command(index: u8, arg: u32, resp: RespType, data: bool) -> Result<[u32; 4], SdError> {
+fn send_command(index: u8, arg: u32, resp: RespType, data: DataDir) -> Result<[u32; 4], SdError> {
     wait_while(200, || unsafe {
         mmio::read(REG_PRESENT_STATE) & (PRESENT_CMD_INHIBIT | PRESENT_DAT_INHIBIT) != 0
     })?;
@@ -120,12 +128,12 @@ fn send_command(index: u8, arg: u32, resp: RespType, data: bool) -> Result<[u32;
     // getting these halves crossed was the actual first bug here --
     // it left Data Present Select unset, so the controller never
     // expected a data phase and Buffer Read Ready never fired.)
-    let command = ((index as u32) << 24) | (resp_bits << 16) | (if data { 1 << 21 } else { 0 });
-    let transfer_mode: u32 = if data {
-        (1 << 1) // Block Count Enable
-            | (1 << 4) // Data Transfer Direction: 1 = read (card to host)
-    } else {
-        0
+    let has_data = data != DataDir::None;
+    let command = ((index as u32) << 24) | (resp_bits << 16) | (if has_data { 1 << 21 } else { 0 });
+    let transfer_mode: u32 = match data {
+        DataDir::None => 0,
+        DataDir::Read => (1 << 1) | (1 << 4), // Block Count Enable | Direction: card to host
+        DataDir::Write => 1 << 1,             // Block Count Enable; Direction bit stays 0 = host to card
     };
     unsafe { mmio::write(REG_TRANSFER_CMD, command | transfer_mode) };
 
@@ -170,10 +178,10 @@ impl Card {
         unsafe { mmio::write(REG_INT_STATUS_ENABLE, 0xFFFF_FFFF) };
         set_clock(400_000)?; // identification-speed clock first, per spec
 
-        send_command(0, 0, RespType::None, false)?; // CMD0: GO_IDLE_STATE
+        send_command(0, 0, RespType::None, DataDir::None)?; // CMD0: GO_IDLE_STATE
 
         // CMD8: SEND_IF_COND -- voltage 2.7-3.6V, check pattern 0xAA.
-        let r7 = send_command(8, 0x1AA, RespType::R1, false)?;
+        let r7 = send_command(8, 0x1AA, RespType::R1, DataDir::None)?;
         if r7[0] & 0xFF != 0xAA {
             return Err(SdError::NoCard);
         }
@@ -182,8 +190,8 @@ impl Card {
         // bit, bit31, set to 1 = not busy = ready).
         let deadline = timer::ticks() + 500; // ~5s at 100Hz
         let ocr = loop {
-            send_command(55, 0, RespType::R1, false)?; // APP_CMD
-            let r3 = send_command(41, 0x40FF_8000, RespType::R1, false)?; // HCS + voltage window
+            send_command(55, 0, RespType::R1, DataDir::None)?; // APP_CMD
+            let r3 = send_command(41, 0x40FF_8000, RespType::R1, DataDir::None)?; // HCS + voltage window
             if r3[0] & (1 << 31) != 0 {
                 break r3[0];
             }
@@ -193,13 +201,13 @@ impl Card {
         };
         let block_addressed = ocr & (1 << 30) != 0; // CCS
 
-        send_command(2, 0, RespType::R2, false)?; // CMD2: ALL_SEND_CID
-        let r6 = send_command(3, 0, RespType::R1, false)?; // CMD3: SEND_RELATIVE_ADDR
+        send_command(2, 0, RespType::R2, DataDir::None)?; // CMD2: ALL_SEND_CID
+        let r6 = send_command(3, 0, RespType::R1, DataDir::None)?; // CMD3: SEND_RELATIVE_ADDR
         let rca = r6[0] & 0xFFFF_0000;
 
         set_clock(25_000_000)?; // up to default-speed clock now identification is done
 
-        send_command(7, rca, RespType::R1, false)?; // CMD7: SELECT_CARD
+        send_command(7, rca, RespType::R1, DataDir::None)?; // CMD7: SELECT_CARD
 
         Ok(Card { rca, block_addressed })
     }
@@ -211,7 +219,7 @@ impl Card {
         let addr = if self.block_addressed { lba } else { lba * 512 };
 
         unsafe { mmio::write(REG_BLOCKSIZE_COUNT, 512 | (1 << 16)) }; // 512 bytes, 1 block
-        send_command(17, addr, RespType::R1, true)?; // CMD17: READ_SINGLE_BLOCK
+        send_command(17, addr, RespType::R1, DataDir::Read)?; // CMD17: READ_SINGLE_BLOCK
 
         wait_while(200, || unsafe {
             let status = mmio::read(REG_INT_STATUS);
@@ -227,6 +235,39 @@ impl Card {
         for chunk in out.chunks_exact_mut(4) {
             let word = unsafe { mmio::read(REG_BUFFER) };
             chunk.copy_from_slice(&word.to_le_bytes());
+        }
+
+        wait_while(200, || unsafe {
+            mmio::read(REG_INT_STATUS) & (INT_TRANSFER_COMPLETE | INT_ERROR_MASK) == 0
+        })?;
+        unsafe { mmio::write(REG_INT_STATUS, INT_TRANSFER_COMPLETE) };
+
+        Ok(())
+    }
+
+    /// Writes one 512-byte block. Same addressing rules as
+    /// read_block: `lba` is always a block number, converted to a
+    /// byte offset internally for SDSC cards.
+    pub fn write_block(&self, lba: u32, data: &[u8; 512]) -> Result<(), SdError> {
+        let addr = if self.block_addressed { lba } else { lba * 512 };
+
+        unsafe { mmio::write(REG_BLOCKSIZE_COUNT, 512 | (1 << 16)) }; // 512 bytes, 1 block
+        send_command(24, addr, RespType::R1, DataDir::Write)?; // CMD24: WRITE_BLOCK
+
+        wait_while(200, || unsafe {
+            let status = mmio::read(REG_INT_STATUS);
+            status & (INT_BUFFER_WRITE_READY | INT_ERROR_MASK) == 0
+        })?;
+        let status = unsafe { mmio::read(REG_INT_STATUS) };
+        if status & INT_ERROR_MASK != 0 {
+            unsafe { mmio::write(REG_INT_STATUS, 0xFFFF_FFFF) };
+            return Err(SdError::Error(status));
+        }
+        unsafe { mmio::write(REG_INT_STATUS, INT_BUFFER_WRITE_READY) };
+
+        for chunk in data.chunks_exact(4) {
+            let word = u32::from_le_bytes(chunk.try_into().unwrap());
+            unsafe { mmio::write(REG_BUFFER, word) };
         }
 
         wait_while(200, || unsafe {

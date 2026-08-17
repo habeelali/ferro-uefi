@@ -124,14 +124,18 @@ struct MenuItem {
     description: &'static str,
 }
 
-const ITEMS: [MenuItem; 3] = [
+const ITEMS: [MenuItem; 4] = [
     MenuItem {
         label: "BOOT FROM SD",
-        description: "MOUNT THE SD CARD AND LIST WHAT'S ON IT",
+        description: "MOUNT THE SD CARD, LOAD SAVED VARIABLES, LIST WHAT'S ON IT",
     },
     MenuItem {
         label: "SYSTEM INFO",
         description: "CPU, TIMER, AND MMU STATE, READ LIVE FROM HARDWARE",
+    },
+    MenuItem {
+        label: "SAVE VARIABLES TO SD",
+        description: "WRITE UEFI VARIABLES TO THE SD CARD'S RESERVED SECTORS",
     },
     MenuItem {
         label: "REBOOT",
@@ -277,6 +281,26 @@ fn boot_from_sd(fb: &Framebuffer, uart: &mut Uart) {
         }
     };
     let mut y = print_lines(fb, uart, CONTENT_X, y, 2, FG, &["FAT32 VOLUME MOUNTED."]);
+
+    match crate::persist::load(&card, &fs) {
+        Ok(n) => {
+            y = print_lines(
+                fb,
+                uart,
+                CONTENT_X,
+                y,
+                2,
+                FG,
+                &["LOADED SAVED VARIABLES FROM SD."],
+            );
+            writeln!(uart, "  ({n} variable(s) merged into the live store)").ok();
+        }
+        Err(e) => {
+            // Nothing saved yet on a fresh card -- not an error worth
+            // interrupting the boot flow for.
+            writeln!(uart, "  no saved variables loaded: {e:?}").ok();
+        }
+    }
 
     let mut names = [[0u8; 11]; 8];
     let mut sizes = [0u32; 8];
@@ -426,11 +450,82 @@ fn boot_efi_app(fb: &Framebuffer, uart: &mut Uart, fs: &Fat32, card: &Card, name
     writeln!(uart, "\n  --- back from StartImage: status=0x{status:x} ---").ok();
 }
 
+fn save_variables_to_sd(fb: &Framebuffer, uart: &mut Uart) {
+    writeln!(uart, "\n[menu] SAVE VARIABLES TO SD selected").ok();
+    draw_chrome(fb, "SAVE VARIABLES TO SD", "PLEASE WAIT...");
+    let y = print_lines(
+        fb,
+        uart,
+        CONTENT_X,
+        CONTENT_Y,
+        2,
+        FG,
+        &["INITIALIZING SD CARD (SDHCI)..."],
+    );
+
+    let card = match Card::init() {
+        Ok(c) => c,
+        Err(e) => {
+            writeln!(uart, "  sd init failed: {e:?}").ok();
+            show_error(
+                fb,
+                uart,
+                "SAVE VARIABLES TO SD",
+                &["SD CARD INIT FAILED.", "SEE UART LOG FOR DETAILS."],
+            );
+            return;
+        }
+    };
+    let y = print_lines(fb, uart, CONTENT_X, y, 2, FG, &["SD CARD READY."]);
+
+    let fs = match Fat32::mount(&card) {
+        Ok(fs) => fs,
+        Err(e) => {
+            writeln!(uart, "  fat32 mount failed: {e:?}").ok();
+            show_error(
+                fb,
+                uart,
+                "SAVE VARIABLES TO SD",
+                &["NO FAT32 VOLUME FOUND.", "SEE UART LOG FOR DETAILS."],
+            );
+            return;
+        }
+    };
+    let y = print_lines(fb, uart, CONTENT_X, y, 2, FG, &["FAT32 VOLUME MOUNTED."]);
+
+    match crate::persist::save(&card, &fs) {
+        Ok(bytes) => {
+            writeln!(uart, "  wrote {bytes} bytes to the reserved-sector scratch region").ok();
+            print_lines(
+                fb,
+                uart,
+                CONTENT_X,
+                y,
+                2,
+                FG,
+                &["VARIABLES SAVED.", "THEY'LL RELOAD NEXT TIME YOU BOOT FROM SD."],
+            );
+        }
+        Err(e) => {
+            writeln!(uart, "  save failed: {e:?}").ok();
+            show_error(
+                fb,
+                uart,
+                "SAVE VARIABLES TO SD",
+                &["FAILED TO SAVE VARIABLES.", "SEE UART LOG FOR DETAILS."],
+            );
+            return;
+        }
+    }
+    wait_for_key(uart);
+}
+
 fn select(fb: &Framebuffer, uart: &mut Uart, s: &MenuState) {
     match s.selected {
         0 => boot_from_sd(fb, uart),
         1 => show_system_info(fb, uart),
-        2 => {
+        2 => save_variables_to_sd(fb, uart),
+        3 => {
             writeln!(uart, "\n[menu] REBOOT selected").ok();
             show_message(fb, uart, "REBOOTING", &["ASKING THE WATCHDOG FOR A RESET..."]);
             pm::reset();
