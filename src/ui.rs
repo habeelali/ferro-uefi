@@ -535,45 +535,87 @@ fn select(fb: &Framebuffer, uart: &mut Uart, s: &MenuState) {
     draw_menu(fb, s);
 }
 
+/// Tracks ANSI-escape parsing state across calls, since arrow keys
+/// arrive as a 3-byte sequence (ESC '[' 'A'/'B') that may be fed in
+/// one byte at a time -- from real UART bytes, or from USB HID
+/// keycodes translated into the same sequence (see hid.rs).
+struct InputState {
+    esc: u8, // 0 = idle, 1 = saw ESC, 2 = saw ESC '['
+}
+
+/// Feeds one input byte through the menu's key handling -- shared by
+/// both the UART path and the USB HID path (translated keycodes are
+/// fed through this same byte vocabulary, see hid::keycode_to_menu_bytes),
+/// so there's exactly one place that knows what a keypress means.
+fn handle_byte(b: u8, input: &mut InputState, fb: &Framebuffer, uart: &mut Uart, state: &mut MenuState) {
+    match input.esc {
+        0 if b == 0x1B => input.esc = 1,
+        1 if b == b'[' => input.esc = 2,
+        2 => {
+            input.esc = 0;
+            match b {
+                b'A' => {
+                    move_up(state);
+                    draw_menu(fb, state);
+                }
+                b'B' => {
+                    move_down(state);
+                    draw_menu(fb, state);
+                }
+                _ => {}
+            }
+        }
+        _ => {
+            input.esc = 0;
+            match b {
+                b'k' | b'K' => {
+                    move_up(state);
+                    draw_menu(fb, state);
+                }
+                b'j' | b'J' => {
+                    move_down(state);
+                    draw_menu(fb, state);
+                }
+                b'\r' | b'\n' => select(fb, uart, state),
+                _ => {}
+            }
+        }
+    }
+}
+
 /// Runs the boot menu forever (selecting Reboot is the only way out,
-/// and that doesn't return either).
+/// and that doesn't return either). Polls both the UART serial
+/// console and, if a USB HID keyboard was found, that too -- either
+/// one drives the same menu through the same key handling.
 pub fn run(fb: &Framebuffer, uart: &mut Uart) -> ! {
     let mut state = MenuState { selected: 0 };
     draw_menu(fb, &state);
 
-    let mut esc_state = 0u8; // 0 = idle, 1 = saw ESC, 2 = saw ESC '['
+    let mut keyboard = crate::usb::init()
+        .ok()
+        .and_then(|speed| crate::hid::find_keyboard(speed).ok());
+    if keyboard.is_some() {
+        writeln!(uart, "\n[menu] USB HID keyboard connected").ok();
+    }
+
+    let mut input = InputState { esc: 0 };
     loop {
-        let Some(b) = uart.getc() else { continue };
-        match esc_state {
-            0 if b == 0x1B => esc_state = 1,
-            1 if b == b'[' => esc_state = 2,
-            2 => {
-                esc_state = 0;
-                match b {
-                    b'A' => {
-                        move_up(&mut state);
-                        draw_menu(fb, &state);
+        if let Some(b) = uart.getc() {
+            handle_byte(b, &mut input, fb, uart, &mut state);
+            continue;
+        }
+
+        if let Some(kbd) = keyboard.as_mut() {
+            if let Ok(keys) = crate::hid::poll_new_keys(kbd) {
+                for &code in keys.iter() {
+                    if code == 0 {
+                        continue;
                     }
-                    b'B' => {
-                        move_down(&mut state);
-                        draw_menu(fb, &state);
+                    let mut bytes = [0u8; 3];
+                    let n = crate::hid::keycode_to_menu_bytes(code, &mut bytes);
+                    for &b in &bytes[..n] {
+                        handle_byte(b, &mut input, fb, uart, &mut state);
                     }
-                    _ => {}
-                }
-            }
-            _ => {
-                esc_state = 0;
-                match b {
-                    b'k' | b'K' => {
-                        move_up(&mut state);
-                        draw_menu(fb, &state);
-                    }
-                    b'j' | b'J' => {
-                        move_down(&mut state);
-                        draw_menu(fb, &state);
-                    }
-                    b'\r' | b'\n' => select(fb, uart, &state),
-                    _ => {}
                 }
             }
         }

@@ -304,6 +304,8 @@ milestone 1: core0 -> EL1 -> UART online
 - `src/fat32.rs` -- read-only FAT32: mount, list root, read file by name.
 - `src/persist.rs` -- variable-store save/load via FAT32's unused reserved sectors.
 - `src/pe.rs` -- PE32+ (AArch64) loader: parse, load, base-relocate.
+- `src/usb.rs` -- DWC2 USB host controller driver (DMA-mode control transfers).
+- `src/hid.rs` -- USB hub traversal + HID boot-protocol keyboard enumeration/polling.
 - `src/efi/` -- UEFI Boot Services core:
   - `types.rs` -- EFI_STATUS, EFI_GUID, EFI_MEMORY_DESCRIPTOR, etc.
   - `memory.rs` -- physical page allocator + memory map builder.
@@ -385,9 +387,53 @@ avoid this. If a future change moves Rust execution earlier in the EL
 chain (e.g. skips through EL2 without landing in `el1_entry`), make
 sure this still happens before the first `bl` into Rust.
 
+## Milestone 14 (in progress): USB (dwc2) host + HID keyboard
+
+The largest single piece of register-level work in the project so
+far, and the most honest write-up needs to say plainly: **the core
+driver is real and verified; the interactive menu integration has a
+known bug that isn't fixed yet.**
+
+What's solid and independently verified:
+- `usb.rs`: a DWC2 (BCM2837's USB 2.0 host controller) driver --
+  core reset, forced host mode, root port power/reset with speed
+  detection, and control transfers. First attempt used slave/FIFO-mode
+  register pushes and got a STALL on every data stage; fetching QEMU's
+  actual `hw/usb/hcd-dwc2.c` from its GitHub mirror (network access
+  turned out to be available) showed its channel logic only ever reads
+  and writes guest memory through the `HCDMA` register -- it doesn't
+  implement FIFO push/pop at all. Rewrote around DMA-mode transfers
+  (with `cache.rs` clean/invalidate around every transfer buffer, the
+  same "not cache-coherent with something else that touches this
+  memory" situation as the GPU mailbox) and a `GET_DESCRIPTOR(DEVICE)`
+  request came back byte-exact correct: `bLength=18`,
+  `bDescriptorType=1`, and a self-consistent 18-byte descriptor --
+  which also revealed the root-port device is a hub (`bDeviceClass=9`),
+  not a keyboard directly, matching what `info usb` showed all along.
+- `hid.rs`: hub traversal (SET_ADDRESS, hub descriptor, per-port
+  power+reset+status) to reach a downstream HID boot-protocol
+  keyboard, its own enumeration (SET_ADDRESS, configuration descriptor
+  parse, SET_CONFIGURATION), and interrupt-endpoint polling. Verified
+  by injecting real keypresses through QEMU's monitor (`sendkey a`,
+  `sendkey b`) during a dedicated polling window and getting back
+  `keydown 0x04`, `keydown 0x05` -- the exact USB HID usage-table
+  keycodes for 'a' and 'b', byte-for-byte matching what was sent.
+
+What's not working yet: wiring that same polling into the interactive
+boot menu (`ui.rs`'s `run()` loop, alongside the existing UART input
+path). Screendump-verified that a `sendkey j` sent while the menu is
+up does not move the selection, even after several seconds -- ruling
+out a timing race. One suspected cause (calling `usb::init()` twice --
+once in a boot-time smoke test, again inside `run()`) was tried and
+ruled out; the actual cause is still open. The boot-time smoke test
+was trimmed back to just a core-ID register read specifically so it
+can't interfere with `run()`'s own enumeration while this gets sorted
+out. UART-driven menu navigation is completely unaffected either way.
+
 ## Next milestones
 
-1. USB (dwc2) + HID, so the menu can be driven from a real keyboard.
+1. Root-cause and fix the USB HID -> boot menu integration bug
+   described above.
 2. Automatic variable persistence (save on `SetVariable` with the
    NON_VOLATILE attribute, rather than only via the explicit menu
    item) and FAT32 write support, so saved state doesn't depend on a

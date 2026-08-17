@@ -12,6 +12,7 @@ mod exceptions;
 mod fat32;
 mod font;
 mod framebuffer;
+mod hid;
 mod irq;
 mod local_intc;
 mod mailbox;
@@ -24,6 +25,7 @@ mod sd;
 mod timer;
 mod uart;
 mod ui;
+mod usb;
 
 use core::fmt::Write;
 use core::panic::PanicInfo;
@@ -68,6 +70,7 @@ pub extern "C" fn ferro_main() -> ! {
             efi::boot_services::set_framebuffer_region(fb.ptr as u64, (fb.pitch as u64) * (fb.height as u64));
             boot_services_smoke_test(&mut uart);
             runtime_services_smoke_test(&mut uart);
+            usb_smoke_test(&mut uart);
 
             ui::boot_log(
                 &fb,
@@ -275,6 +278,18 @@ fn runtime_services_smoke_test(uart: &mut uart::Uart) {
         "milestone 11: QueryVariableInfo -> status=0x{status:x} max={max_storage} remaining={remaining} max_var={max_var}"
     )
     .ok();
+}
+
+/// Confirms the dwc2 core register interface responds sanely (a
+/// non-garbage GSNPSID) before boot proceeds. Deliberately does NOT
+/// call usb::init() here: that does a real port reset, and the actual
+/// enumeration (hub traversal, SET_ADDRESS, HID keyboard setup) needs
+/// to happen exactly once, for real, in ui::run() -- calling
+/// usb::init() a second time there after this smoke test already did
+/// its own reset+enumeration is what broke the menu's real keyboard
+/// input the first time this was wired up.
+fn usb_smoke_test(uart: &mut uart::Uart) {
+    writeln!(uart, "milestone 14: USB core ID = 0x{:08x}", usb::core_id()).ok();
 }
 
 #[panic_handler]
