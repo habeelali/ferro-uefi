@@ -6,11 +6,30 @@
 # and starts all 4 Cortex-A53 cores at its entry point, same as the real
 # armstub8.bin hand-off would. That's exactly the milestone-1 target:
 # our AArch64 code as the first (and only) thing that runs after reset.
+#
+# Usage: run-qemu.sh [debug|release] [--gui]
+#   --gui opens a real window showing the framebuffer (splash/boot
+#   menu). Keyboard input for the menu still goes through THIS
+#   terminal (arrows/j/k/Enter) -- the menu reads UART, not the
+#   graphical window's keyboard, since there's no USB HID driver yet.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-PROFILE="${1:-debug}"
+PROFILE="debug"
+DISPLAY_MODE="none"
+for arg in "$@"; do
+    case "$arg" in
+        --gui) DISPLAY_MODE="gtk" ;;
+        debug|release) PROFILE="$arg" ;;
+        *)
+            echo "error: unrecognized argument '$arg'" >&2
+            echo "usage: $0 [debug|release] [--gui]" >&2
+            exit 1
+            ;;
+    esac
+done
+
 BIN="target/aarch64-unknown-none/${PROFILE}/ferro"
 
 if [[ ! -f "$BIN" ]]; then
@@ -24,4 +43,4 @@ exec qemu-system-aarch64 \
     -M raspi3b \
     -kernel "$BIN" \
     -serial stdio \
-    -display none
+    -display "$DISPLAY_MODE"
