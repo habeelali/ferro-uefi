@@ -10,8 +10,10 @@ mod crc32;
 pub mod memory;
 pub mod protocol_db;
 pub mod protocols;
+pub mod runtime_services;
 pub mod system_table;
 pub mod types;
+pub mod variables;
 
 /// Brings the whole layer up: page allocator, then the table headers
 /// and their CRCs. Must run after mmu::init() (memory.rs's allocator
@@ -19,5 +21,6 @@ pub mod types;
 pub fn init() {
     memory::init();
     boot_services::init();
+    runtime_services::init();
     system_table::init();
 }

@@ -66,6 +66,7 @@ pub extern "C" fn ferro_main() -> ! {
 
             efi::boot_services::set_framebuffer_region(fb.ptr as u64, (fb.pitch as u64) * (fb.height as u64));
             boot_services_smoke_test(&mut uart);
+            runtime_services_smoke_test(&mut uart);
 
             ui::boot_log(
                 &fb,
@@ -179,6 +180,100 @@ fn boot_services_smoke_test(uart: &mut uart::Uart) {
         )
         .ok();
     }
+}
+
+/// Exercises Runtime Services through the real EFI_RUNTIME_SERVICES
+/// function-pointer table. Doesn't touch ResetSystem here -- that one
+/// is meant to never return, and does exercise it for real from the
+/// boot menu's Reboot option instead.
+fn runtime_services_smoke_test(uart: &mut uart::Uart) {
+    use efi::runtime_services::EfiTime;
+    use efi::types::*;
+    use core::ffi::c_void;
+
+    let rs = unsafe { &*core::ptr::addr_of!(efi::runtime_services::RUNTIME_SERVICES) };
+
+    // Spec-legal EFI_UNSUPPORTED: BCM2837 has no RTC, so this is the
+    // honest answer, not a stand-in for missing code.
+    let mut time = EfiTime {
+        year: 0,
+        month: 0,
+        day: 0,
+        hour: 0,
+        minute: 0,
+        second: 0,
+        pad1: 0,
+        nanosecond: 0,
+        time_zone: 0,
+        daylight: 0,
+        pad2: 0,
+    };
+    let status = (rs.get_time)(&mut time, core::ptr::null_mut());
+    writeln!(
+        uart,
+        "milestone 11: GetTime -> status=0x{status:x} (EFI_UNSUPPORTED expected: no RTC on this SoC)"
+    )
+    .ok();
+
+    let name: [u16; 5] = [b'T' as u16, b'E' as u16, b'S' as u16, b'T' as u16, 0];
+    let guid = EfiGuid {
+        data1: 0x1111_2222,
+        data2: 0x3333,
+        data3: 0x4444,
+        data4: [5, 6, 7, 8, 9, 10, 11, 12],
+    };
+    let data = b"hello-runtime-services";
+    let status = (rs.set_variable)(
+        name.as_ptr(),
+        &guid,
+        0x7, // NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS
+        data.len(),
+        data.as_ptr() as *const c_void,
+    );
+    writeln!(uart, "milestone 11: SetVariable -> status=0x{status:x}").ok();
+
+    let mut out = [0u8; 64];
+    let mut out_size = out.len();
+    let mut attrs = 0u32;
+    let status = (rs.get_variable)(
+        name.as_ptr(),
+        &guid,
+        &mut attrs,
+        &mut out_size,
+        out.as_mut_ptr() as *mut c_void,
+    );
+    let round_trip_ok = status == EFI_SUCCESS && &out[..out_size] == &data[..];
+    writeln!(
+        uart,
+        "milestone 11: GetVariable -> status=0x{status:x} round_trip_ok={round_trip_ok}"
+    )
+    .ok();
+
+    let mut nn_buf = [0u16; 32];
+    let mut nn_size = nn_buf.len() * 2;
+    let mut nn_guid = EfiGuid {
+        data1: 0,
+        data2: 0,
+        data3: 0,
+        data4: [0; 8],
+    };
+    let status = (rs.get_next_variable_name)(&mut nn_size, nn_buf.as_mut_ptr(), &mut nn_guid);
+    writeln!(
+        uart,
+        "milestone 11: GetNextVariableName -> status=0x{status:x} guid_matches={}",
+        nn_guid == guid
+    )
+    .ok();
+
+    let mut max_storage = 0u64;
+    let mut remaining = 0u64;
+    let mut max_var = 0u64;
+    let status = (rs.query_variable_info)(0x7, &mut max_storage, &mut remaining, &mut max_var);
+    writeln!(
+        uart,
+        "milestone 11: QueryVariableInfo -> status=0x{status:x} max={max_storage} remaining={remaining} max_var={max_var}"
+    )
+    .ok();
 }
 
 #[panic_handler]

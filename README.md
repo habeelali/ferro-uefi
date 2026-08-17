@@ -196,6 +196,28 @@ pre-relocation value. `StartImage` then correctly received
 `EFI_SUCCESS` back through a real `ret`, and the boot menu resumed
 normally afterward. Verified on both debug and release builds.
 
+**Milestone 11 (done):** UEFI Runtime Services (`efi/runtime_services.rs`,
+`efi/variables.rs`) -- `EFI_RUNTIME_SERVICES` laid out field-for-field
+per spec, wired into `EFI_SYSTEM_TABLE.RuntimeServices`. Real logic
+backs the parts that can be real on this hardware: `GetVariable`/
+`SetVariable`/`GetNextVariableName`/`QueryVariableInfo` are a genuine
+fixed-capacity (32 variables, 512 bytes each) in-RAM store -- no
+persistence across reboots yet, since there's no flash/NVRAM driver,
+an honest first slice rather than a hidden gap. `ResetSystem` reuses
+`pm.rs`'s real watchdog sequence instead of being stubbed. `GetTime`/
+`SetTime`/`GetWakeupTime`/`SetWakeupTime` return `EFI_UNSUPPORTED` --
+not a stand-in for unwritten code, but the spec-legal, honest answer
+for a board with no RTC or wakeup-timer hardware.
+`SetVirtualAddressMap`/`ConvertPointer` are correct no-ops for Ferro
+specifically, since boot and runtime both stay in the identity map
+`mmu.rs` set up -- there's no virtual/physical split to translate.
+Verified by calling through the real function-pointer table:
+`SetVariable`/`GetVariable` round-trip real data correctly,
+`GetNextVariableName` enumerates back the exact GUID that was set,
+and `QueryVariableInfo` reports numbers that check out exactly against
+the store's real fixed capacity and what's actually used
+(`remaining = 16384 - 22`, the exact byte length of the test variable).
+
 ```
 $ ./scripts/run-qemu.sh
 Ferro UEFI
@@ -229,6 +251,8 @@ milestone 1: core0 -> EL1 -> UART online
   - `protocol_db.rs` -- fixed-capacity handle/protocol database.
   - `protocols.rs` -- protocol structs installed on handles (EFI_LOADED_IMAGE_PROTOCOL so far).
   - `boot_services.rs` -- EFI_BOOT_SERVICES: real subset + spec-shaped stubs.
+  - `runtime_services.rs` -- EFI_RUNTIME_SERVICES: variables + real ResetSystem.
+  - `variables.rs` -- fixed-capacity in-RAM UEFI variable store.
   - `system_table.rs` -- EFI_SYSTEM_TABLE.
   - `crc32.rs` -- CRC-32 shared by CalculateCrc32 and table header checksums.
 - `src/main.rs` -- `ferro_main`, panic handler.
@@ -304,9 +328,13 @@ sure this still happens before the first `bl` into Rust.
 
 ## Next milestones
 
-1. UEFI Runtime Services + variable storage.
-2. USB (dwc2) + HID, so the menu can be driven from a real keyboard.
-3. Real Pi 3 hardware validation -- nothing here has touched physical
+1. USB (dwc2) + HID, so the menu can be driven from a real keyboard.
+2. Persist the variable store across reboots (needs a flash/NVRAM
+   driver, or at minimum writing it to the SD card) -- currently
+   real but RAM-only.
+3. A menu item that actually boots what's loaded (call ExitBootServices
+   and hand off) instead of returning to the menu after StartImage.
+4. Real Pi 3 hardware validation -- nothing here has touched physical
    hardware yet, and there are two known gaps waiting there: the
    pm.rs reset sequence (right code, unverified effect) and sd.rs's
    controller choice (right controller for QEMU, wrong one for the
