@@ -218,6 +218,35 @@ and `QueryVariableInfo` reports numbers that check out exactly against
 the store's real fixed capacity and what's actually used
 (`remaining = 16384 - 22`, the exact byte length of the test variable).
 
+**Milestone 12 (done):** real `ExitBootServices` (`boot_services.rs`),
+including the actual map-key handshake, not just a status code.
+`GetMemoryMap` now hands back a map key that changes exactly when the
+memory map does (a generation counter in `memory.rs`, bumped on every
+`AllocatePages`) instead of always returning 0. `ExitBootServices`
+checks the caller's key against the current generation and rejects a
+stale one with `EFI_INVALID_PARAMETER` -- the real protocol a bootloader
+is supposed to follow (fetch the map, note the key, call
+ExitBootServices with that exact key, retry from the top if it was
+rejected because something else changed the map in between). On
+success, a handful of boot-only services (`AllocatePages`/
+`AllocatePool`/`LoadImage`/`StartImage`) start correctly returning
+`EFI_UNSUPPORTED`, while variable and other runtime services -- which
+the spec says must keep working -- are untouched by the flag, and
+`GetMemoryMap` itself is deliberately left ungated since the spec
+explicitly permits calling it afterward too.
+
+Calling `ExitBootServices` successfully is a one-way trip -- boot
+services stay off for the rest of that boot, which would break Ferro's
+own menu trying to `LoadImage` a second time in the same session -- so
+this was verified with a temporary, isolated test call (wrong key
+correctly rejected, real key correctly accepted, `AllocatePages`
+correctly gated off afterward, variable services correctly still
+working afterward) that was removed once confirmed, the same way
+earlier temporary UART tracing was. The real implementation it
+verified stays in `boot_services.rs`; only the throwaway test call
+was reverted. Full regression (menu, SD/FAT32, PE loader) re-verified
+clean afterward on both debug and release builds.
+
 ```
 $ ./scripts/run-qemu.sh
 Ferro UEFI
@@ -332,9 +361,7 @@ sure this still happens before the first `bl` into Rust.
 2. Persist the variable store across reboots (needs a flash/NVRAM
    driver, or at minimum writing it to the SD card) -- currently
    real but RAM-only.
-3. A menu item that actually boots what's loaded (call ExitBootServices
-   and hand off) instead of returning to the menu after StartImage.
-4. Real Pi 3 hardware validation -- nothing here has touched physical
+3. Real Pi 3 hardware validation -- nothing here has touched physical
    hardware yet, and there are two known gaps waiting there: the
    pm.rs reset sequence (right code, unverified effect) and sd.rs's
    controller choice (right controller for QEMU, wrong one for the

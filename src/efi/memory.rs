@@ -26,6 +26,11 @@ const RAM_LIMIT: u64 = crate::mmio::PERIPHERAL_BASE as u64;
 
 static NEXT_FREE_PAGE: AtomicU64 = AtomicU64::new(0);
 
+/// Bumped on every successful allocation, so GetMemoryMap can hand out
+/// a map key that changes exactly when the map does -- what
+/// ExitBootServices is supposed to check before tearing anything down.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
 fn firmware_end() -> u64 {
     core::ptr::addr_of!(__end) as u64
 }
@@ -50,9 +55,17 @@ pub fn allocate_pages(count: u64) -> Option<u64> {
             .compare_exchange(base, new, Ordering::Relaxed, Ordering::Relaxed)
             .is_ok()
         {
+            GENERATION.fetch_add(1, Ordering::Relaxed);
             return Some(base);
         }
     }
+}
+
+/// The current memory-map "map key" -- changes exactly when the map
+/// does, which is what ExitBootServices's caller is required to have
+/// an up-to-date copy of.
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Relaxed)
 }
 
 fn bump_mark() -> u64 {

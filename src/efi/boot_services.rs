@@ -12,7 +12,7 @@ use super::protocol_db;
 use super::protocols::{EfiLoadedImageProtocol, LOADED_IMAGE_PROTOCOL_GUID};
 use super::types::*;
 use core::ffi::c_void;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 pub type RaiseTplFn = extern "C" fn(usize) -> usize;
 pub type RestoreTplFn = extern "C" fn(usize);
@@ -29,6 +29,7 @@ pub type LocateProtocolFn = extern "C" fn(*const EfiGuid, *mut c_void, *mut *mut
 pub type LoadImageFn =
     extern "C" fn(u8, EfiHandle, *mut c_void, *mut c_void, usize, *mut EfiHandle) -> EfiStatus;
 pub type StartImageFn = extern "C" fn(EfiHandle, *mut usize, *mut *mut u16) -> EfiStatus;
+pub type ExitBootServicesFn = extern "C" fn(EfiHandle, usize) -> EfiStatus;
 pub type StallFn = extern "C" fn(usize) -> EfiStatus;
 pub type CopyMemFn = extern "C" fn(*mut c_void, *const c_void, usize);
 pub type SetMemFn = extern "C" fn(*mut c_void, usize, u8);
@@ -73,7 +74,7 @@ pub struct BootServices {
     pub start_image: StartImageFn,
     pub exit: StubFn,
     pub unload_image: StubFn,
-    pub exit_boot_services: StubFn,
+    pub exit_boot_services: ExitBootServicesFn,
 
     pub get_next_monotonic_count: StubFn,
     pub stall: StallFn,
@@ -113,6 +114,17 @@ pub fn set_framebuffer_region(base: u64, size: u64) {
 
 static CURRENT_TPL: AtomicUsize = AtomicUsize::new(4); // TPL_APPLICATION
 
+/// Set once ExitBootServices succeeds. Per spec, a real batch of Boot
+/// Services functions become invalid to call after that point; the
+/// functions below that matter for us check this and return
+/// EFI_UNSUPPORTED instead of silently doing boot-time things after
+/// the caller has taken over the machine.
+static BOOT_SERVICES_EXITED: AtomicBool = AtomicBool::new(false);
+
+fn exited() -> bool {
+    BOOT_SERVICES_EXITED.load(Ordering::Relaxed)
+}
+
 // LoadImage/StartImage state. EFI_LOADED_IMAGE_PROTOCOL doesn't carry
 // an entry-point field (real firmwares track that internally too), so
 // ENTRY_POINTS is a parallel table keyed by the same handle index
@@ -148,6 +160,9 @@ extern "C" fn restore_tpl(old_tpl: usize) {
 }
 
 extern "C" fn allocate_pages(_alloc_type: u32, _memory_type: u32, pages: usize, memory: *mut u64) -> EfiStatus {
+    if exited() {
+        return EFI_UNSUPPORTED;
+    }
     if memory.is_null() {
         return EFI_INVALID_PARAMETER;
     }
@@ -202,7 +217,9 @@ extern "C" fn get_memory_map(
         }
     }
     if !map_key.is_null() {
-        unsafe { *map_key = 0 }; // no reclamation yet, so no key to invalidate against
+        // Changes exactly when the map does (see memory.rs); this is
+        // what ExitBootServices checks against.
+        unsafe { *map_key = super::memory::generation() as usize };
     }
     if !descriptor_size.is_null() {
         unsafe { *descriptor_size = desc_size };
@@ -214,6 +231,9 @@ extern "C" fn get_memory_map(
 }
 
 extern "C" fn allocate_pool(_pool_type: u32, size: usize, buffer: *mut *mut c_void) -> EfiStatus {
+    if exited() {
+        return EFI_UNSUPPORTED;
+    }
     if buffer.is_null() {
         return EFI_INVALID_PARAMETER;
     }
@@ -321,6 +341,9 @@ extern "C" fn load_image(
     source_size: usize,
     image_handle: *mut EfiHandle,
 ) -> EfiStatus {
+    if exited() {
+        return EFI_UNSUPPORTED;
+    }
     if source_buffer.is_null() || image_handle.is_null() || source_size == 0 {
         return EFI_INVALID_PARAMETER;
     }
@@ -365,6 +388,9 @@ extern "C" fn start_image(
     _exit_data_size: *mut usize,
     _exit_data: *mut *mut u16,
 ) -> EfiStatus {
+    if exited() {
+        return EFI_UNSUPPORTED;
+    }
     let Some(index) = protocol_db::index_of(image_handle) else {
         return EFI_INVALID_PARAMETER;
     };
@@ -377,6 +403,24 @@ extern "C" fn start_image(
         unsafe { core::mem::transmute(entry as usize) };
     let st = core::ptr::addr_of_mut!(super::system_table::SYSTEM_TABLE);
     entry_fn(image_handle, st)
+}
+
+/// The real map-key handshake: the caller must pass the map_key it
+/// got from a GetMemoryMap call made after its own last allocation,
+/// proving it isn't about to tear things down against a stale map.
+/// `_image_handle` isn't checked against anything -- we don't track
+/// "the" boot image the way a real firmware with a single boot flow
+/// does, since Ferro's own menu can load different images across
+/// multiple attempts.
+extern "C" fn exit_boot_services(_image_handle: EfiHandle, map_key: usize) -> EfiStatus {
+    if exited() {
+        return EFI_SUCCESS; // already exited; idempotent per spec intent
+    }
+    if map_key as u64 != super::memory::generation() {
+        return EFI_INVALID_PARAMETER;
+    }
+    BOOT_SERVICES_EXITED.store(true, Ordering::Relaxed);
+    EFI_SUCCESS
 }
 
 extern "C" fn stub() -> EfiStatus {
@@ -422,7 +466,7 @@ pub static mut BOOT_SERVICES: BootServices = BootServices {
     start_image,
     exit: stub,
     unload_image: stub,
-    exit_boot_services: stub,
+    exit_boot_services,
 
     get_next_monotonic_count: stub,
     stall,
