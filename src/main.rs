@@ -7,6 +7,7 @@
 #![no_main]
 
 mod cache;
+mod efi;
 mod exceptions;
 mod font;
 mod framebuffer;
@@ -29,6 +30,7 @@ core::arch::global_asm!(include_str!("vectors.s"));
 #[no_mangle]
 pub extern "C" fn ferro_main() -> ! {
     unsafe { mmu::init() };
+    efi::init();
 
     let mut uart = uart::Uart::init();
 
@@ -59,6 +61,22 @@ pub extern "C" fn ferro_main() -> ! {
             )
             .ok();
 
+            efi::boot_services::set_framebuffer_region(fb.ptr as u64, (fb.pitch as u64) * (fb.height as u64));
+            boot_services_smoke_test(&mut uart);
+
+            ui::boot_log(
+                &fb,
+                &[
+                    "CORE0 -> EL1 (BOOT.S)",
+                    "EXCEPTION VECTORS INSTALLED (VECTORS.S)",
+                    "MMU ENABLED: RAM=NORMAL WB, MMIO=DEVICE-NGNRNE",
+                    "TIMER/IRQ ONLINE (BCM2836 LOCAL BLOCK, NOT A GIC)",
+                    "FRAMEBUFFER ALLOCATED VIA VIDEOCORE MAILBOX",
+                    "STARTING BOOT MENU...",
+                ],
+            );
+            timer::sleep_ticks(150); // ~1.5s, long enough to actually read it
+
             ui::splash(&fb);
             timer::sleep_ticks(150); // ~1.5s
             writeln!(uart, "milestone 6: entering boot menu (serial console input)").ok();
@@ -70,6 +88,92 @@ pub extern "C" fn ferro_main() -> ! {
                 unsafe { core::arch::asm!("wfe") };
             }
         }
+    }
+}
+
+/// Exercises Boot Services entirely through the real EFI_BOOT_SERVICES
+/// function-pointer table -- the same table (same ABI) a loaded EFI
+/// application will eventually call through, once there's a loader.
+fn boot_services_smoke_test(uart: &mut uart::Uart) {
+    use efi::types::*;
+
+    let bs = unsafe { &*core::ptr::addr_of!(efi::boot_services::BOOT_SERVICES) };
+
+    let mut page: u64 = 0;
+    let status = (bs.allocate_pages)(0, EFI_BOOT_SERVICES_DATA, 2, &mut page);
+    writeln!(
+        uart,
+        "milestone 7: AllocatePages(2) -> status=0x{status:x} base=0x{page:x}"
+    )
+    .ok();
+
+    let mut pool: *mut core::ffi::c_void = core::ptr::null_mut();
+    let status = (bs.allocate_pool)(EFI_BOOT_SERVICES_DATA, 100, &mut pool);
+    writeln!(
+        uart,
+        "milestone 7: AllocatePool(100) -> status=0x{status:x} ptr={pool:p}"
+    )
+    .ok();
+
+    let test_guid = EfiGuid {
+        data1: 0x1234_5678,
+        data2: 0xABCD,
+        data3: 0xEF01,
+        data4: [1, 2, 3, 4, 5, 6, 7, 8],
+    };
+    let marker: u32 = 0xFEED_FACE;
+    let marker_ptr = &marker as *const u32 as *mut core::ffi::c_void;
+    let mut handle: EfiHandle = core::ptr::null_mut();
+    let status = (bs.install_protocol_interface)(&mut handle, &test_guid, 0, marker_ptr);
+    writeln!(
+        uart,
+        "milestone 7: InstallProtocolInterface -> status=0x{status:x} handle={handle:p}"
+    )
+    .ok();
+
+    let mut found: *mut core::ffi::c_void = core::ptr::null_mut();
+    let status = (bs.locate_protocol)(&test_guid, core::ptr::null_mut(), &mut found);
+    writeln!(
+        uart,
+        "milestone 7: LocateProtocol -> status=0x{status:x} round_trip_ok={}",
+        found == marker_ptr
+    )
+    .ok();
+
+    let mut map = [EfiMemoryDescriptor {
+        ty: 0,
+        physical_start: 0,
+        virtual_start: 0,
+        number_of_pages: 0,
+        attribute: 0,
+    }; 8];
+    let mut map_size = core::mem::size_of_val(&map);
+    let mut map_key = 0usize;
+    let mut desc_size = 0usize;
+    let mut desc_version = 0u32;
+    let status = (bs.get_memory_map)(
+        &mut map_size,
+        map.as_mut_ptr(),
+        &mut map_key,
+        &mut desc_size,
+        &mut desc_version,
+    );
+    let count = map_size / desc_size.max(1);
+    writeln!(
+        uart,
+        "milestone 7: GetMemoryMap -> status=0x{status:x} entries={count}"
+    )
+    .ok();
+    for d in &map[..count] {
+        writeln!(
+            uart,
+            "  [{:#010x}-{:#010x}) type={} pages={}",
+            d.physical_start,
+            d.physical_start + d.number_of_pages * 4096,
+            d.ty,
+            d.number_of_pages
+        )
+        .ok();
     }
 }
 

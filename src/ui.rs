@@ -20,6 +20,21 @@ fn text_width(text: &str, scale: u32) -> u32 {
     text.chars().count() as u32 * (GLYPH_WIDTH + 1) * scale
 }
 
+/// A POST-style text log shown on the framebuffer before the branded
+/// splash -- everything up to this point (EL drop, MMU, timer/IRQ,
+/// framebuffer itself) only ever reached UART, since there was no
+/// display yet to put it on.
+pub fn boot_log(fb: &Framebuffer, lines: &[&str]) {
+    fb.clear(BG);
+    fb.draw_text(20, 20, "FERRO UEFI - BOOT LOG", 3, ACCENT);
+    let mut y = 70;
+    for line in lines {
+        fb.draw_text(20, y, line, 2, FG);
+        y += 26;
+    }
+    fb.flush();
+}
+
 pub fn splash(fb: &Framebuffer) {
     fb.clear(BG);
 

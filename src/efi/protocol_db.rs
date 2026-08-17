@@ -1,0 +1,119 @@
+//! Fixed-capacity handle/protocol database. No heap exists yet, so
+//! this is plain static arrays rather than the Vec-of-Vecs a real
+//! implementation would use -- MAX_HANDLES/MAX_PROTOCOLS_PER_HANDLE
+//! are the honest capacity limit that comes with that.
+
+use super::types::EfiGuid;
+use core::ffi::c_void;
+
+const MAX_HANDLES: usize = 32;
+const MAX_PROTOCOLS_PER_HANDLE: usize = 8;
+
+#[derive(Clone, Copy)]
+struct ProtocolEntry {
+    guid: EfiGuid,
+    interface: *mut c_void,
+}
+
+#[derive(Clone, Copy)]
+struct HandleEntry {
+    in_use: bool,
+    protocols: [Option<ProtocolEntry>; MAX_PROTOCOLS_PER_HANDLE],
+}
+
+const EMPTY_HANDLE: HandleEntry = HandleEntry {
+    in_use: false,
+    protocols: [None; MAX_PROTOCOLS_PER_HANDLE],
+};
+
+static mut HANDLES: [HandleEntry; MAX_HANDLES] = [EMPTY_HANDLE; MAX_HANDLES];
+
+/// Handles are just table indices disguised as pointers (offset by 1
+/// so index 0 doesn't collide with NULL) -- valid per spec, since
+/// EFI_HANDLE is an opaque token callers are never meant to deref.
+fn handle_to_index(handle: *mut c_void) -> Option<usize> {
+    let raw = handle as usize;
+    if raw == 0 {
+        None
+    } else {
+        Some(raw - 1)
+    }
+}
+
+fn index_to_handle(index: usize) -> *mut c_void {
+    (index + 1) as *mut c_void
+}
+
+/// Finds an existing handle's slot, or allocates a fresh one. Returns
+/// None if the table is full.
+pub fn find_or_create_handle(existing: *mut c_void) -> Option<usize> {
+    let handles = core::ptr::addr_of_mut!(HANDLES);
+    if let Some(i) = handle_to_index(existing) {
+        return unsafe { (*handles)[i].in_use.then_some(i) };
+    }
+    unsafe {
+        for i in 0..MAX_HANDLES {
+            if !(*handles)[i].in_use {
+                (*handles)[i] = EMPTY_HANDLE;
+                (*handles)[i].in_use = true;
+                return Some(i);
+            }
+        }
+    }
+    None
+}
+
+pub fn handle_for_index(index: usize) -> *mut c_void {
+    index_to_handle(index)
+}
+
+/// Installs `interface` under `guid` on the handle at `index`. Returns
+/// false if that handle's protocol slots are all full.
+pub fn install(index: usize, guid: EfiGuid, interface: *mut c_void) -> bool {
+    let handles = core::ptr::addr_of_mut!(HANDLES);
+    unsafe {
+        for slot in (*handles)[index].protocols.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(ProtocolEntry { guid, interface });
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// First handle (in table order) exposing `guid`, and its interface
+/// pointer.
+pub fn locate(guid: &EfiGuid) -> Option<*mut c_void> {
+    let handles = core::ptr::addr_of!(HANDLES);
+    unsafe {
+        for h in (*handles).iter() {
+            if !h.in_use {
+                continue;
+            }
+            for slot in h.protocols.iter().flatten() {
+                if slot.guid == *guid {
+                    return Some(slot.interface);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `guid`'s interface pointer on a specific handle.
+pub fn handle_protocol(handle: *mut c_void, guid: &EfiGuid) -> Option<*mut c_void> {
+    let index = handle_to_index(handle)?;
+    let handles = core::ptr::addr_of!(HANDLES);
+    unsafe {
+        if !(*handles)[index].in_use {
+            return None;
+        }
+        for slot in (*handles)[index].protocols.iter().flatten() {
+            if slot.guid == *guid {
+                return Some(slot.interface);
+            }
+        }
+    }
+    None
+}

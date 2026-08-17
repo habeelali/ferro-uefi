@@ -44,3 +44,14 @@ pub fn sleep_ticks(n: u64) {
         unsafe { asm!("wfe") };
     }
 }
+
+/// Rounds a microsecond duration up to whole ticks, for callers (like
+/// EFI_BOOT_SERVICES.Stall) that only know time in microseconds.
+pub fn micros_to_ticks(us: u64) -> u64 {
+    let freq: u64;
+    unsafe { asm!("mrs {0}, cntfrq_el0", out(reg) freq) };
+    let interval = TICK_INTERVAL.load(Ordering::Relaxed).max(1);
+    let numerator = us.saturating_mul(freq);
+    let denominator = 1_000_000 * interval;
+    (numerator + denominator - 1) / denominator
+}

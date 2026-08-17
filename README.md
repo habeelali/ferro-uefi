@@ -69,7 +69,29 @@ correct real-hardware reset sequence, but QEMU's `bcm2835-powermgt`
 model doesn't act on it, so nothing actually restarts under QEMU --
 untested whether it resets real hardware.
 
-No UEFI services yet; that's the next layer to build.
+**Milestone 7 (done):** UEFI Boot Services core (`src/efi/`) -- the
+first genuinely UEFI-spec layer, not just bare-metal bring-up. A
+physical page allocator (bump-pointer; `FreePages`/`FreePool` are
+accepted but don't reclaim yet -- honest first slice) backs a real
+`EFI_MEMORY_DESCRIPTOR` memory map built from actual boot state
+(linker symbols for the firmware's own footprint, the real framebuffer
+address/size from the mailbox, the real MMU region boundaries), plus a
+fixed-capacity protocol database. `EFI_BOOT_SERVICES` and
+`EFI_SYSTEM_TABLE` are laid out field-for-field per the UEFI 2.x spec
+-- correct ABI matters since real EFI applications will call through
+these by fixed offset -- with a working subset wired to real logic
+(memory services, protocol install/locate/handle, Stall, CopyMem/
+SetMem, a real CRC32 used for both `CalculateCrc32` and the tables'
+own header checksums) and the rest honestly stubbed at
+`EFI_UNSUPPORTED` pending the code that needs them. Verified by calling
+through the actual function-pointer table -- not the Rust functions
+directly -- the same way a loaded EFI application eventually will:
+`AllocatePages`/`AllocatePool` return real sequential addresses,
+`InstallProtocolInterface`/`LocateProtocol` round-trip a test GUID
+correctly, and `GetMemoryMap`'s 8 returned descriptors match reality
+exactly (firmware image bounds, the live allocator bump pointer, the
+real framebuffer region, and the peripheral/ARM-local MMIO ranges all
+line up with independently-known values).
 
 ```
 $ ./scripts/run-qemu.sh
@@ -93,8 +115,15 @@ milestone 1: core0 -> EL1 -> UART online
 - `src/mailbox.rs` -- VideoCore property-tag mailbox protocol.
 - `src/framebuffer.rs` -- framebuffer allocation + pixel/rect/text drawing.
 - `src/font.rs` -- 5x7 bitmap font (just the glyphs the UI uses).
-- `src/ui.rs` -- splash screen + boot menu (UART-driven navigation).
+- `src/ui.rs` -- boot log, splash screen, boot menu (UART-driven navigation).
 - `src/pm.rs` -- BCM2837 power management (watchdog reset).
+- `src/efi/` -- UEFI Boot Services core:
+  - `types.rs` -- EFI_STATUS, EFI_GUID, EFI_MEMORY_DESCRIPTOR, etc.
+  - `memory.rs` -- physical page allocator + memory map builder.
+  - `protocol_db.rs` -- fixed-capacity handle/protocol database.
+  - `boot_services.rs` -- EFI_BOOT_SERVICES: real subset + spec-shaped stubs.
+  - `system_table.rs` -- EFI_SYSTEM_TABLE.
+  - `crc32.rs` -- CRC-32 shared by CalculateCrc32 and table header checksums.
 - `src/main.rs` -- `ferro_main`, panic handler.
 - `src/mmio.rs` -- BCM2837 peripheral base addresses, volatile MMIO helpers.
 - `src/uart.rs` -- PL011 UART0 driver (+ the GPIO alt-function setup it needs).
@@ -155,7 +184,9 @@ sure this still happens before the first `bl` into Rust.
 
 ## Next milestones
 
-1. UEFI Boot Services core (memory map, protocol database).
-2. SD/MMC + FAT32, so "Boot from SD" in the menu can do something real.
+1. SD/MMC + FAT32, so "Boot from SD" in the menu can do something real.
+2. A PE/COFF loader + LoadImage/StartImage, so a real `.efi` binary can
+   actually run against the Boot Services table instead of only Ferro's
+   own smoke test calling through it.
 3. UEFI Runtime Services + variable storage.
 4. USB (dwc2) + HID, so the menu can be driven from a real keyboard.
