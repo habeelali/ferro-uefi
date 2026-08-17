@@ -61,6 +61,15 @@ impl Framebuffer {
         self.fill_rect(0, 0, self.width, self.height, color);
     }
 
+    /// Draws a `thickness`-pixel border around the given rectangle
+    /// (the border is inside the rectangle's bounds, not outside).
+    pub fn draw_rect_outline(&self, x: u32, y: u32, w: u32, h: u32, thickness: u32, color: u32) {
+        self.fill_rect(x, y, w, thickness, color); // top
+        self.fill_rect(x, y + h.saturating_sub(thickness), w, thickness, color); // bottom
+        self.fill_rect(x, y, thickness, h, color); // left
+        self.fill_rect(x + w.saturating_sub(thickness), y, thickness, h, color); // right
+    }
+
     /// Push pending writes out to the point of coherency so the GPU's
     /// display pipeline (which doesn't snoop our D-cache) sees them.
     pub fn flush(&self) {

@@ -68,6 +68,7 @@ pub extern "C" fn ferro_main() -> ! {
 
             ui::boot_log(
                 &fb,
+                &mut uart,
                 &[
                     "CORE0 -> EL1 (BOOT.S)",
                     "EXCEPTION VECTORS INSTALLED (VECTORS.S)",
@@ -77,7 +78,7 @@ pub extern "C" fn ferro_main() -> ! {
                     "STARTING BOOT MENU...",
                 ],
             );
-            timer::sleep_ticks(150); // ~1.5s, long enough to actually read it
+            timer::sleep_ticks(60); // brief hold once the log finishes printing
 
             ui::splash(&fb);
             timer::sleep_ticks(150); // ~1.5s

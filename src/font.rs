@@ -4,6 +4,7 @@
 //! [4:0] = pixel columns left-to-right (bit4 = leftmost).
 
 pub const GLYPH_WIDTH: u32 = 5;
+pub const GLYPH_HEIGHT: u32 = 7;
 
 pub fn glyph(c: char) -> [u8; 7] {
     match c.to_ascii_uppercase() {

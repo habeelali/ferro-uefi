@@ -4,37 +4,103 @@
 //! serial console (arrow keys or j/k, Enter to select) while the menu
 //! renders to the framebuffer at the same time -- a real dual-output
 //! setup UI, just keyboard-less until USB exists.
+//!
+//! Every screen shares a common header/footer/border "chrome"
+//! (`draw_chrome`) and prints its body text one line at a time with a
+//! real delay and a live UART mirror (`print_lines`), rather than
+//! blitting the whole screen at once -- closer to how real firmware
+//! setup screens and POST logs actually read.
 
 use crate::fat32::Fat32;
-use crate::font::GLYPH_WIDTH;
+use crate::font::{GLYPH_HEIGHT, GLYPH_WIDTH};
 use crate::framebuffer::Framebuffer;
 use crate::sd::Card;
 use crate::uart::Uart;
 use crate::{pm, timer};
 use core::fmt::Write;
 
-const BG: u32 = 0x0018_2028;
+const BG: u32 = 0x0012_1620;
+const HEADER_BG: u32 = 0x0020_2A38;
+const SELECT_BG: u32 = 0x002A_3A4A;
+const BORDER: u32 = 0x0035_4250;
 const FG: u32 = 0x00E0_E6EC;
 const ACCENT: u32 = 0x00FF_A030;
 const DIM: u32 = 0x0070_7880;
+const ERROR: u32 = 0x00FF_5040;
+
+const HEADER_H: u32 = 50;
+const FOOTER_H: u32 = 40;
+const MARGIN: u32 = 20;
+const CONTENT_X: u32 = 40;
+const CONTENT_Y: u32 = HEADER_H + 35;
+
+/// Ticks between lines when printing progressively -- short enough not
+/// to feel sluggish, long enough to actually read as sequential rather
+/// than instant.
+const LINE_DELAY_TICKS: u64 = 6;
 
 fn text_width(text: &str, scale: u32) -> u32 {
     text.chars().count() as u32 * (GLYPH_WIDTH + 1) * scale
+}
+
+fn line_height(scale: u32) -> u32 {
+    (GLYPH_HEIGHT + 3) * scale
+}
+
+/// Shared screen chrome: header bar with the firmware name and a
+/// per-screen title, a bordered content panel, and a footer bar with
+/// a context hint. Every screen after the splash uses this so the UI
+/// reads as one coherent piece of firmware rather than a pile of ad
+/// hoc drawing calls.
+fn draw_chrome(fb: &Framebuffer, title: &str, hint: &str) {
+    fb.clear(BG);
+
+    fb.fill_rect(0, 0, fb.width, HEADER_H, HEADER_BG);
+    fb.draw_text(MARGIN, 16, "FERRO UEFI", 3, ACCENT);
+    let title_x = fb.width.saturating_sub(text_width(title, 2) + MARGIN);
+    fb.draw_text(title_x, 19, title, 2, FG);
+    fb.fill_rect(0, HEADER_H, fb.width, 2, BORDER);
+
+    fb.fill_rect(0, fb.height - FOOTER_H, fb.width, FOOTER_H, HEADER_BG);
+    fb.fill_rect(0, fb.height - FOOTER_H, fb.width, 2, BORDER);
+    fb.draw_text(MARGIN, fb.height - FOOTER_H + 12, hint, 2, DIM);
+
+    let panel_y = HEADER_H + 12;
+    let panel_h = fb.height - HEADER_H - FOOTER_H - 24;
+    fb.draw_rect_outline(MARGIN, panel_y, fb.width - 2 * MARGIN, panel_h, 2, BORDER);
+
+    fb.flush();
+}
+
+/// Draws and UART-mirrors `lines` one at a time with a real delay
+/// between them, returning the y coordinate just past the last line.
+fn print_lines(
+    fb: &Framebuffer,
+    uart: &mut Uart,
+    x: u32,
+    y: u32,
+    scale: u32,
+    color: u32,
+    lines: &[&str],
+) -> u32 {
+    let mut cy = y;
+    for line in lines {
+        fb.draw_text(x, cy, line, scale, color);
+        fb.flush();
+        writeln!(uart, "{line}").ok();
+        timer::sleep_ticks(LINE_DELAY_TICKS);
+        cy += line_height(scale);
+    }
+    cy
 }
 
 /// A POST-style text log shown on the framebuffer before the branded
 /// splash -- everything up to this point (EL drop, MMU, timer/IRQ,
 /// framebuffer itself) only ever reached UART, since there was no
 /// display yet to put it on.
-pub fn boot_log(fb: &Framebuffer, lines: &[&str]) {
-    fb.clear(BG);
-    fb.draw_text(20, 20, "FERRO UEFI - BOOT LOG", 3, ACCENT);
-    let mut y = 70;
-    for line in lines {
-        fb.draw_text(20, y, line, 2, FG);
-        y += 26;
-    }
-    fb.flush();
+pub fn boot_log(fb: &Framebuffer, uart: &mut Uart, lines: &[&str]) {
+    draw_chrome(fb, "BOOT LOG", "PLEASE WAIT...");
+    print_lines(fb, uart, CONTENT_X, CONTENT_Y, 2, FG, lines);
 }
 
 pub fn splash(fb: &Framebuffer) {
@@ -53,7 +119,25 @@ pub fn splash(fb: &Framebuffer) {
     fb.flush();
 }
 
-const ITEMS: [&str; 3] = ["BOOT FROM SD", "SYSTEM INFO", "REBOOT"];
+struct MenuItem {
+    label: &'static str,
+    description: &'static str,
+}
+
+const ITEMS: [MenuItem; 3] = [
+    MenuItem {
+        label: "BOOT FROM SD",
+        description: "MOUNT THE SD CARD AND LIST WHAT'S ON IT",
+    },
+    MenuItem {
+        label: "SYSTEM INFO",
+        description: "CPU, TIMER, AND MMU STATE, READ LIVE FROM HARDWARE",
+    },
+    MenuItem {
+        label: "REBOOT",
+        description: "ISSUE A WATCHDOG RESET",
+    },
+];
 
 struct MenuState {
     selected: usize,
@@ -68,26 +152,23 @@ fn move_down(s: &mut MenuState) {
 }
 
 fn draw_menu(fb: &Framebuffer, s: &MenuState) {
-    fb.clear(BG);
-    fb.draw_text(40, 40, "FERRO UEFI - BOOT MENU", 4, ACCENT);
+    draw_chrome(fb, "BOOT MANAGER", "ARROWS OR J/K: MOVE    ENTER: SELECT");
 
-    let mut y = 160;
+    let row_h = 46;
+    let mut y = CONTENT_Y + 10;
     for (i, item) in ITEMS.iter().enumerate() {
-        let color = if i == s.selected { ACCENT } else { FG };
         if i == s.selected {
-            fb.draw_text(40, y, ">", 3, ACCENT);
+            fb.fill_rect(CONTENT_X, y - 8, fb.width - 2 * CONTENT_X, row_h, SELECT_BG);
+            fb.fill_rect(CONTENT_X, y - 8, 4, row_h, ACCENT);
         }
-        fb.draw_text(90, y, item, 3, color);
-        y += 50;
+        let color = if i == s.selected { ACCENT } else { FG };
+        fb.draw_text(CONTENT_X + 30, y, item.label, 3, color);
+        y += row_h + 8;
     }
 
-    fb.draw_text(
-        40,
-        fb.height - 60,
-        "J/K OR ARROWS: MOVE   ENTER: SELECT",
-        2,
-        DIM,
-    );
+    let desc_y = fb.height - FOOTER_H - 34;
+    fb.draw_text(CONTENT_X, desc_y, ITEMS[s.selected].description, 2, DIM);
+
     fb.flush();
 }
 
@@ -100,16 +181,14 @@ fn wait_for_key(uart: &mut Uart) {
 }
 
 fn show_message(fb: &Framebuffer, uart: &mut Uart, title: &str, lines: &[&str]) {
-    fb.clear(BG);
-    fb.draw_text(40, 40, title, 4, ACCENT);
-    let mut y = 130;
-    for line in lines {
-        fb.draw_text(40, y, line, 2, FG);
-        writeln!(uart, "  {line}").ok();
-        y += 30;
-    }
-    fb.draw_text(40, fb.height - 60, "PRESS ANY KEY TO RETURN", 2, DIM);
-    fb.flush();
+    draw_chrome(fb, title, "PRESS ANY KEY TO RETURN");
+    print_lines(fb, uart, CONTENT_X, CONTENT_Y, 2, FG, lines);
+    wait_for_key(uart);
+}
+
+fn show_error(fb: &Framebuffer, uart: &mut Uart, title: &str, lines: &[&str]) {
+    draw_chrome(fb, title, "PRESS ANY KEY TO RETURN");
+    print_lines(fb, uart, CONTENT_X, CONTENT_Y, 2, ERROR, lines);
     wait_for_key(uart);
 }
 
@@ -136,31 +215,44 @@ fn show_system_info(fb: &Framebuffer, uart: &mut Uart) {
     .ok();
     writeln!(uart, "  mmu   : enabled (identity-mapped RAM + device regions)").ok();
 
-    show_message(
+    draw_chrome(fb, "SYSTEM INFO", "PRESS ANY KEY TO RETURN");
+    print_lines(
         fb,
         uart,
-        "SYSTEM INFO",
+        CONTENT_X,
+        CONTENT_Y,
+        2,
+        FG,
         &[
             "BOARD: RASPBERRY PI 3 / BCM2837",
             "CPU: 4X CORTEX-A53",
-            "MMU: ENABLED",
-            "FULL DETAIL SENT OVER UART",
+            "MMU: ENABLED (IDENTITY-MAPPED)",
+            "TIMER: BCM2836 LOCAL BLOCK (NOT A GIC)",
+            "",
+            "FULL REGISTER DUMP SENT OVER UART",
         ],
     );
+    wait_for_key(uart);
 }
 
 fn boot_from_sd(fb: &Framebuffer, uart: &mut Uart) {
     writeln!(uart, "\n[menu] BOOT FROM SD selected").ok();
-    fb.clear(BG);
-    fb.draw_text(40, 40, "BOOT FROM SD", 4, ACCENT);
-    fb.draw_text(40, 110, "INITIALIZING SD CARD (SDHCI)...", 2, FG);
-    fb.flush();
+    draw_chrome(fb, "BOOT FROM SD", "PLEASE WAIT...");
+    let y = print_lines(
+        fb,
+        uart,
+        CONTENT_X,
+        CONTENT_Y,
+        2,
+        FG,
+        &["INITIALIZING SD CARD (SDHCI)..."],
+    );
 
     let card = match Card::init() {
         Ok(c) => c,
         Err(e) => {
             writeln!(uart, "  sd init failed: {e:?}").ok();
-            show_message(
+            show_error(
                 fb,
                 uart,
                 "BOOT FROM SD",
@@ -169,13 +261,13 @@ fn boot_from_sd(fb: &Framebuffer, uart: &mut Uart) {
             return;
         }
     };
-    writeln!(uart, "  sd card ready").ok();
+    let y = print_lines(fb, uart, CONTENT_X, y, 2, FG, &["SD CARD READY."]);
 
     let fs = match Fat32::mount(&card) {
         Ok(fs) => fs,
         Err(e) => {
             writeln!(uart, "  fat32 mount failed: {e:?}").ok();
-            show_message(
+            show_error(
                 fb,
                 uart,
                 "BOOT FROM SD",
@@ -184,7 +276,7 @@ fn boot_from_sd(fb: &Framebuffer, uart: &mut Uart) {
             return;
         }
     };
-    writeln!(uart, "  fat32 mounted").ok();
+    let mut y = print_lines(fb, uart, CONTENT_X, y, 2, FG, &["FAT32 VOLUME MOUNTED."]);
 
     let mut names = [[0u8; 11]; 8];
     let mut sizes = [0u32; 8];
@@ -192,7 +284,7 @@ fn boot_from_sd(fb: &Framebuffer, uart: &mut Uart) {
         Ok(n) => n,
         Err(e) => {
             writeln!(uart, "  list_root failed: {e:?}").ok();
-            show_message(
+            show_error(
                 fb,
                 uart,
                 "BOOT FROM SD",
@@ -203,21 +295,22 @@ fn boot_from_sd(fb: &Framebuffer, uart: &mut Uart) {
     };
 
     writeln!(uart, "  root directory ({count} entries):").ok();
-    fb.clear(BG);
-    fb.draw_text(40, 40, "BOOT FROM SD - ROOT DIRECTORY", 3, ACCENT);
-    let mut y = 110;
+    y += line_height(2);
+    fb.draw_text(CONTENT_X, y, "ROOT DIRECTORY:", 2, ACCENT);
+    y += line_height(2);
     for i in 0..count {
         let name = core::str::from_utf8(&names[i]).unwrap_or("????????.???");
+        fb.draw_text(CONTENT_X + 20, y, name, 2, FG);
+        fb.flush();
         writeln!(uart, "    {name}  {} bytes", sizes[i]).ok();
-        fb.draw_text(40, y, name, 2, FG);
-        y += 26;
+        timer::sleep_ticks(LINE_DELAY_TICKS);
+        y += line_height(2);
     }
     if count == 0 {
-        fb.draw_text(40, y, "(EMPTY)", 2, DIM);
+        fb.draw_text(CONTENT_X + 20, y, "(EMPTY)", 2, DIM);
+        y += line_height(2);
     }
 
-    // Read the first entry's contents for real, as proof the data path
-    // (not just directory metadata) works end to end.
     if count > 0 {
         let mut content = [0u8; 256];
         match fs.read_file(&card, &names[0], &mut content) {
@@ -225,10 +318,10 @@ fn boot_from_sd(fb: &Framebuffer, uart: &mut Uart) {
                 let text = core::str::from_utf8(&content[..n]).unwrap_or("<binary>");
                 writeln!(uart, "  first file contents ({n} bytes):").ok();
                 writeln!(uart, "{text}").ok();
-                y += 40;
-                fb.draw_text(40, y, "FIRST FILE (SEE UART FOR FULL CONTENTS):", 2, DIM);
-                y += 26;
-                fb.draw_text(40, y, text.lines().next().unwrap_or(text), 2, ACCENT);
+                y += line_height(2);
+                fb.draw_text(CONTENT_X, y, "FIRST FILE (FULL TEXT OVER UART):", 2, DIM);
+                y += line_height(2);
+                fb.draw_text(CONTENT_X + 20, y, text.lines().next().unwrap_or(text), 2, ACCENT);
             }
             Err(e) => {
                 writeln!(uart, "  read_file failed: {e:?}").ok();
@@ -236,7 +329,6 @@ fn boot_from_sd(fb: &Framebuffer, uart: &mut Uart) {
         }
     }
 
-    fb.draw_text(40, fb.height - 60, "PRESS ANY KEY TO RETURN", 2, DIM);
     fb.flush();
     wait_for_key(uart);
 }

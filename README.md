@@ -129,6 +129,23 @@ walk, data read -- not just a mount success code. A no-card run was
 verified too: a real, decoded hardware error (Command Timeout) and a
 clean return to the menu, not a hang.
 
+**Milestone 9 (done):** UI overhaul (`ui.rs`). Every screen after the
+splash now shares real chrome -- a header bar with the firmware name
+and a per-screen title, a bordered content panel, a footer bar with a
+context-specific hint -- instead of being drawn ad hoc. The boot menu
+gained a proper highlight bar (filled row + left accent stripe, not
+just colored text and a `>` cursor) and a live description line for
+whichever item is selected. Body text on every screen -- the boot log,
+system info, Boot from SD's directory listing and file preview, error
+screens -- now prints one line at a time with a real delay
+(`print_lines`), each line also mirrored to UART as it appears, rather
+than the previous instant full-screen blit. Verified with QEMU
+screendumps: all seven chrome/state colors (background, header/footer,
+border, selection highlight, dim, accent, foreground) present exactly
+where the layout code puts them, and the existing keystroke-driven
+interaction tests (System Info, Boot from SD with a real FAT32 image)
+re-verified against the new code with identical, correct output.
+
 ```
 $ ./scripts/run-qemu.sh
 Ferro UEFI
