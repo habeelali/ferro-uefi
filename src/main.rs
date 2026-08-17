@@ -9,6 +9,7 @@
 mod cache;
 mod efi;
 mod exceptions;
+mod fat32;
 mod font;
 mod framebuffer;
 mod irq;
@@ -17,6 +18,7 @@ mod mailbox;
 mod mmio;
 mod mmu;
 mod pm;
+mod sd;
 mod timer;
 mod uart;
 mod ui;

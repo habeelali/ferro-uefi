@@ -5,8 +5,10 @@
 //! renders to the framebuffer at the same time -- a real dual-output
 //! setup UI, just keyboard-less until USB exists.
 
+use crate::fat32::Fat32;
 use crate::font::GLYPH_WIDTH;
 use crate::framebuffer::Framebuffer;
+use crate::sd::Card;
 use crate::uart::Uart;
 use crate::{pm, timer};
 use core::fmt::Write;
@@ -147,17 +149,101 @@ fn show_system_info(fb: &Framebuffer, uart: &mut Uart) {
     );
 }
 
-fn select(fb: &Framebuffer, uart: &mut Uart, s: &MenuState) {
-    match s.selected {
-        0 => {
-            writeln!(uart, "\n[menu] BOOT FROM SD selected").ok();
+fn boot_from_sd(fb: &Framebuffer, uart: &mut Uart) {
+    writeln!(uart, "\n[menu] BOOT FROM SD selected").ok();
+    fb.clear(BG);
+    fb.draw_text(40, 40, "BOOT FROM SD", 4, ACCENT);
+    fb.draw_text(40, 110, "INITIALIZING SD CARD (SDHCI)...", 2, FG);
+    fb.flush();
+
+    let card = match Card::init() {
+        Ok(c) => c,
+        Err(e) => {
+            writeln!(uart, "  sd init failed: {e:?}").ok();
             show_message(
                 fb,
                 uart,
                 "BOOT FROM SD",
-                &["NO STORAGE DRIVER YET.", "SD/FAT32 IS A LATER MILESTONE."],
+                &["SD CARD INIT FAILED.", "SEE UART LOG FOR DETAILS."],
             );
+            return;
         }
+    };
+    writeln!(uart, "  sd card ready").ok();
+
+    let fs = match Fat32::mount(&card) {
+        Ok(fs) => fs,
+        Err(e) => {
+            writeln!(uart, "  fat32 mount failed: {e:?}").ok();
+            show_message(
+                fb,
+                uart,
+                "BOOT FROM SD",
+                &["NO FAT32 VOLUME FOUND.", "SEE UART LOG FOR DETAILS."],
+            );
+            return;
+        }
+    };
+    writeln!(uart, "  fat32 mounted").ok();
+
+    let mut names = [[0u8; 11]; 8];
+    let mut sizes = [0u32; 8];
+    let count = match fs.list_root(&card, &mut names, &mut sizes) {
+        Ok(n) => n,
+        Err(e) => {
+            writeln!(uart, "  list_root failed: {e:?}").ok();
+            show_message(
+                fb,
+                uart,
+                "BOOT FROM SD",
+                &["FAILED TO READ ROOT DIRECTORY."],
+            );
+            return;
+        }
+    };
+
+    writeln!(uart, "  root directory ({count} entries):").ok();
+    fb.clear(BG);
+    fb.draw_text(40, 40, "BOOT FROM SD - ROOT DIRECTORY", 3, ACCENT);
+    let mut y = 110;
+    for i in 0..count {
+        let name = core::str::from_utf8(&names[i]).unwrap_or("????????.???");
+        writeln!(uart, "    {name}  {} bytes", sizes[i]).ok();
+        fb.draw_text(40, y, name, 2, FG);
+        y += 26;
+    }
+    if count == 0 {
+        fb.draw_text(40, y, "(EMPTY)", 2, DIM);
+    }
+
+    // Read the first entry's contents for real, as proof the data path
+    // (not just directory metadata) works end to end.
+    if count > 0 {
+        let mut content = [0u8; 256];
+        match fs.read_file(&card, &names[0], &mut content) {
+            Ok(n) => {
+                let text = core::str::from_utf8(&content[..n]).unwrap_or("<binary>");
+                writeln!(uart, "  first file contents ({n} bytes):").ok();
+                writeln!(uart, "{text}").ok();
+                y += 40;
+                fb.draw_text(40, y, "FIRST FILE (SEE UART FOR FULL CONTENTS):", 2, DIM);
+                y += 26;
+                fb.draw_text(40, y, text.lines().next().unwrap_or(text), 2, ACCENT);
+            }
+            Err(e) => {
+                writeln!(uart, "  read_file failed: {e:?}").ok();
+            }
+        }
+    }
+
+    fb.draw_text(40, fb.height - 60, "PRESS ANY KEY TO RETURN", 2, DIM);
+    fb.flush();
+    wait_for_key(uart);
+}
+
+fn select(fb: &Framebuffer, uart: &mut Uart, s: &MenuState) {
+    match s.selected {
+        0 => boot_from_sd(fb, uart),
         1 => show_system_info(fb, uart),
         2 => {
             writeln!(uart, "\n[menu] REBOOT selected").ok();

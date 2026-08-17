@@ -57,8 +57,8 @@ boundary -- not just that the mailbox call returned success.
 (`font.rs`, `ui.rs`). No USB HID driver exists yet, so navigation is
 over the UART serial console (arrow keys or j/k, Enter to select)
 while the same UI renders to the framebuffer simultaneously. Items:
-Boot from SD (reports not-yet-implemented -- true, that's milestone 8),
-System Info (reads MIDR_EL1/CNTFRQ_EL0/CurrentEL for real and prints
+Boot from SD (now real -- see milestone 8), System Info (reads
+MIDR_EL1/CNTFRQ_EL0/CurrentEL for real and prints
 them), Reboot (issues the real BCM283x watchdog-reset sequence via
 `pm.rs`). Verified by driving QEMU's serial console with actual
 keystrokes end-to-end -- not just rendering a static screen -- and
@@ -93,6 +93,42 @@ exactly (firmware image bounds, the live allocator bump pointer, the
 real framebuffer region, and the peripheral/ARM-local MMIO ranges all
 line up with independently-known values).
 
+**Milestone 8 (done):** SD card + FAT32 (`sd.rs`, `fat32.rs`) --
+"Boot from SD" in the menu now really talks to hardware. One
+significant real-vs-emulated mismatch found and documented up front:
+Pi 3 has *two* SD-capable controllers, and which one is which differs
+between real hardware and QEMU. On a physical Pi 3, the external
+microSD slot is wired to the proprietary `sdhost` controller while the
+standard SDHCI (Arasan) controller only reaches the onboard WiFi chip
+-- confirmed via Raspberry Pi's own device tree. QEMU's `raspi3b`,
+however, only attaches a `-drive if=sd` image to SDHCI; `sdhost`'s bus
+in the emulated machine is left with no card and no straightforward
+way to attach one. Rather than build something unverifiable, Ferro
+targets SDHCI: fully real, fully tested end-to-end, but **won't read
+the boot SD card on physical Pi 3 hardware** without a further
+sdhost-specific driver -- tracked the same way as the pm.rs reset gap,
+not hidden.
+
+Found one real bug the hard way: the SDHCI Command register (word bits
+[31:16]) and Transfer Mode register (word bits [15:0]) share one
+32-bit register at offset 0x0C, and Data Present Select is a *Command*
+register bit -- an early version set it at word bit 5 instead of word
+bit 21, landing it in a reserved Transfer Mode bit instead. Command
+completion still fired (the controller didn't know a data phase was
+coming), but Buffer Read Ready never did, so every block read hung.
+Diagnosed by adding temporary UART tracing around each wait, narrowing
+it to exactly that transition, then removed once fixed.
+
+Verified with a real MBR-partitioned FAT32 image built via `parted` +
+`mkfs.fat --offset` + `mtools` (no loopback mount needed, no root):
+booted QEMU with `-drive if=sd,file=...`, selected Boot from SD over
+the serial console, and got back an exact root-directory listing (two
+files, correct sizes) plus a byte-for-byte-correct multi-line file
+read through the full stack -- MBR parse, BPB parse, FAT cluster-chain
+walk, data read -- not just a mount success code. A no-card run was
+verified too: a real, decoded hardware error (Command Timeout) and a
+clean return to the menu, not a hang.
+
 ```
 $ ./scripts/run-qemu.sh
 Ferro UEFI
@@ -117,6 +153,8 @@ milestone 1: core0 -> EL1 -> UART online
 - `src/font.rs` -- 5x7 bitmap font (just the glyphs the UI uses).
 - `src/ui.rs` -- boot log, splash screen, boot menu (UART-driven navigation).
 - `src/pm.rs` -- BCM2837 power management (watchdog reset).
+- `src/sd.rs` -- SDHCI SD card driver (see milestone 8's real-vs-emulated caveat).
+- `src/fat32.rs` -- read-only FAT32: mount, list root, read file by name.
 - `src/efi/` -- UEFI Boot Services core:
   - `types.rs` -- EFI_STATUS, EFI_GUID, EFI_MEMORY_DESCRIPTOR, etc.
   - `memory.rs` -- physical page allocator + memory map builder.
@@ -154,6 +192,19 @@ buffering artifact in the consuming command, not a firmware bug. Piping
 straight to a terminal, or using `-serial file:out.log`, doesn't have
 this problem.
 
+To try "Boot from SD" with a real FAT32 image (no loopback mount, no
+root needed):
+
+```
+dd if=/dev/zero of=sd.img bs=1M count=64
+parted -s sd.img mklabel msdos
+parted -s sd.img mkpart primary fat32 1MiB 100%
+mkfs.fat -F 32 --offset=2048 sd.img
+mcopy -i sd.img@@1M somefile.txt ::SOMEFILE.TXT
+qemu-system-aarch64 -M raspi3b -kernel target/aarch64-unknown-none/debug/ferro \
+    -drive if=sd,file=sd.img,format=raw -serial stdio -display none
+```
+
 ## Real hardware
 
 Not yet exercised on physical Pi 3, but the intended path is:
@@ -184,9 +235,14 @@ sure this still happens before the first `bl` into Rust.
 
 ## Next milestones
 
-1. SD/MMC + FAT32, so "Boot from SD" in the menu can do something real.
-2. A PE/COFF loader + LoadImage/StartImage, so a real `.efi` binary can
+1. A PE/COFF loader + LoadImage/StartImage, so a real `.efi` binary can
    actually run against the Boot Services table instead of only Ferro's
-   own smoke test calling through it.
-3. UEFI Runtime Services + variable storage.
-4. USB (dwc2) + HID, so the menu can be driven from a real keyboard.
+   own smoke test calling through it -- FAT32 can already find and read
+   the file, this is "parse it as PE/COFF and jump in."
+2. UEFI Runtime Services + variable storage.
+3. USB (dwc2) + HID, so the menu can be driven from a real keyboard.
+4. Real Pi 3 hardware validation -- nothing here has touched physical
+   hardware yet, and there are two known gaps waiting there: the
+   pm.rs reset sequence (right code, unverified effect) and sd.rs's
+   controller choice (right controller for QEMU, wrong one for the
+   physical SD slot -- would need an sdhost driver).
