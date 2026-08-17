@@ -22,6 +22,17 @@ instruction, alignment fault, ...) now prints its kind, decoded EC,
 ESR/ELR/FAR/SPSR, and halts -- instead of silently hanging. Verified by
 deliberately reading an unmapped address and confirming the report.
 
+**Milestone 3 (done):** Stage-1 MMU enabled. Identity-mapped (4KiB
+granule, level-1 as top level): RAM as Normal Write-Back/executable up
+to the peripheral base, BCM2837 peripherals and the 0x4000_0000
+ARM-local region as Device-nGnRnE/non-executable. Data and instruction
+caches on. Verified two ways: normal boot still reaches the UART banner
+with caches + translation live, and a deliberate read past the mapped
+range (0x9000_0000) now reports a genuine "Translation fault, level 1"
+(DFSC 0x05) through the same exception path -- unmapped memory now
+faults *because of the page tables*, not because nothing answered the
+bus.
+
 No UEFI services yet; that's the next layer to build.
 
 ```
@@ -38,6 +49,7 @@ milestone 1: core0 -> EL1 -> UART online
 - `src/vectors.s` -- EL1 exception vector table; each vector forwards
   (kind, ESR, ELR, FAR, SPSR) to `rust_exception_handler`.
 - `src/exceptions.rs` -- decodes and prints fatal exceptions, then halts.
+- `src/mmu.rs` -- stage-1 page tables (identity map) and MMU enable.
 - `src/main.rs` -- `ferro_main`, panic handler.
 - `src/mmio.rs` -- BCM2837 peripheral base addresses, volatile MMIO helpers.
 - `src/uart.rs` -- PL011 UART0 driver (+ the GPIO alt-function setup it needs).
@@ -98,10 +110,8 @@ sure this still happens before the first `bl` into Rust.
 
 ## Next milestones
 
-1. MMU + page tables (identity map RAM + device regions) -- now that
-   faults are diagnosable, this is the next thing likely to produce them.
-2. Timer / mailbox / GIC bring-up.
-3. UEFI Boot Services core (memory map, protocol database).
-4. SD/MMC + FAT32, so we can load an actual OS.
-5. UEFI Runtime Services + variable storage.
-6. Setup UI, boot manager.
+1. Timer / mailbox / GIC bring-up.
+2. UEFI Boot Services core (memory map, protocol database).
+3. SD/MMC + FAT32, so we can load an actual OS.
+4. UEFI Runtime Services + variable storage.
+5. Setup UI, boot manager.

@@ -8,6 +8,7 @@
 
 mod exceptions;
 mod mmio;
+mod mmu;
 mod uart;
 
 use core::fmt::Write;
@@ -18,11 +19,14 @@ core::arch::global_asm!(include_str!("vectors.s"));
 
 #[no_mangle]
 pub extern "C" fn ferro_main() -> ! {
+    unsafe { mmu::init() };
+
     let mut uart = uart::Uart::init();
 
     writeln!(uart, "\nFerro UEFI").ok();
     writeln!(uart, "Raspberry Pi 3 / BCM2837, AArch64").ok();
     writeln!(uart, "milestone 1: core0 -> EL1 -> UART online").ok();
+    writeln!(uart, "milestone 3: MMU enabled, RAM + device regions identity-mapped").ok();
 
     loop {
         unsafe { core::arch::asm!("wfe") };
