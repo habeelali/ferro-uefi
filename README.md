@@ -312,12 +312,21 @@ milestone 1: core0 -> EL1 -> UART online
 - `src/pe.rs` -- PE32+ (AArch64) loader: parse, load, base-relocate.
 - `src/usb.rs` -- DWC2 USB host controller driver (DMA-mode control transfers).
 - `src/hid.rs` -- USB hub traversal + HID boot-protocol keyboard enumeration/polling.
-- `src/efi/` -- UEFI Boot Services core:
+- `src/efi/` -- UEFI Boot/Runtime Services core:
   - `types.rs` -- EFI_STATUS, EFI_GUID, EFI_MEMORY_DESCRIPTOR, etc.
   - `memory.rs` -- physical page allocator + memory map builder.
   - `protocol_db.rs` -- fixed-capacity handle/protocol database.
-  - `protocols.rs` -- protocol structs installed on handles (EFI_LOADED_IMAGE_PROTOCOL so far).
-  - `boot_services.rs` -- EFI_BOOT_SERVICES: real subset + spec-shaped stubs.
+  - `protocols.rs` -- EFI_LOADED_IMAGE_PROTOCOL.
+  - `console.rs` -- EFI_SIMPLE_TEXT_OUTPUT/INPUT_PROTOCOL (ConOut/ConIn),
+    a real scrolling text console on the framebuffer + UART/USB HID input.
+  - `events.rs` -- CreateEvent/SetTimer/WaitForEvent/SignalEvent/CheckEvent,
+    honestly busy-polled (no interrupt-driven scheduler exists).
+  - `block_io.rs` -- EFI_BLOCK_IO_PROTOCOL wrapping sd.rs.
+  - `file_protocol.rs` -- EFI_SIMPLE_FILE_SYSTEM_PROTOCOL + EFI_FILE_PROTOCOL
+    wrapping fat32.rs (root directory only).
+  - `device_path.rs` -- minimal real EFI_DEVICE_PATH_PROTOCOL nodes.
+  - `boot_services.rs` -- EFI_BOOT_SERVICES: real subset + a few
+    genuinely-can't-implement-in-Rust or needs-a-driver-model stubs.
   - `runtime_services.rs` -- EFI_RUNTIME_SERVICES: variables + real ResetSystem.
   - `variables.rs` -- fixed-capacity in-RAM UEFI variable store.
   - `system_table.rs` -- EFI_SYSTEM_TABLE.
@@ -328,6 +337,14 @@ milestone 1: core0 -> EL1 -> UART online
 - `linker.ld` -- links at `0x80000`, the Pi's default AArch64 kernel load
   address (also what QEMU's `raspi3b -kernel` loader uses).
 - `scripts/run-qemu.sh` -- build-and-boot under QEMU.
+- `efi-test-app/` -- a separate crate: a real `aarch64-unknown-uefi`
+  binary (rustc's own UEFI target, no `uefi` crate dependency) used to
+  conformance-test Ferro's console/file-system/boot-services
+  implementation against actual EFI ABI calls, not another
+  hand-crafted PE. Build with
+  `cd efi-test-app && cargo build --target aarch64-unknown-uefi --release`
+  (needs `rustup target add aarch64-unknown-uefi` once); the result is
+  a real `.efi` file, copy it onto a FAT32 test image as `TEST.EFI`.
 
 ## Building
 
@@ -540,6 +557,82 @@ host side, not just by reading it back through Ferro's own driver
   one session) exercised the existing-file resize path, not just
   first-time creation.
 
+## Milestone 18 (done): the rest of UEFI a real bootloader needs
+
+Through milestone 17, Ferro could load and run a hand-crafted PE file
+that never touched `SystemTable->ConOut`, never opened a file through
+`EFI_SIMPLE_FILE_SYSTEM_PROTOCOL`, and used only a handful of Boot
+Services. A real bootloader (GRUB, systemd-boot, Linux's EFI stub)
+does all of that immediately. This milestone closes that gap:
+
+- **`efi/console.rs`** -- real `EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL` and
+  `EFI_SIMPLE_TEXT_INPUT_PROTOCOL`, wired into `SystemTable->ConOut`/
+  `ConIn` (previously null). Output renders as an actual scrolling
+  text console on the framebuffer -- `Framebuffer::scroll_up` is new,
+  a raw overlap-safe memmove of the pixel buffer -- and mirrors to
+  UART; input reads from UART and, if present, the USB HID keyboard,
+  the same input paths the boot menu itself uses.
+- **`efi/events.rs`** -- `CreateEvent`/`SetTimer`/`WaitForEvent`/
+  `SignalEvent`/`CheckEvent`/`CloseEvent`, honestly implemented as a
+  busy-poll (Ferro has no interrupt-driven scheduler) that re-derives
+  each event's condition fresh rather than trusting a stale flag --
+  needed for `ConIn`'s `WaitForKey` event, which real input-reading
+  code commonly waits on before calling `ReadKeyStroke`.
+- **`efi/block_io.rs`** -- `EFI_BLOCK_IO_PROTOCOL` wrapping `sd.rs`.
+- **`efi/file_protocol.rs`** -- `EFI_SIMPLE_FILE_SYSTEM_PROTOCOL` +
+  `EFI_FILE_PROTOCOL` (Open/Close/Read/Write/GetPosition/SetPosition/
+  GetInfo/Flush, plus directory enumeration -- reading a directory
+  handle returns one `EFI_FILE_INFO` per call, real `ls` support)
+  wrapping `fat32.rs`. Root-directory files only, and each open file's
+  contents are cached whole in a fixed 64KiB slot rather than streamed
+  (`fat32::read_file` only ever reads a whole file from the start) --
+  a documented, honest limitation, not a silent one.
+- **`efi/device_path.rs`** -- minimal but real `EFI_DEVICE_PATH_PROTOCOL`
+  node structures, replacing the null `LoadedImage->FilePath` that
+  existed before: a loaded image now gets a real `DeviceHandle`
+  (installed with BlockIO + SimpleFileSystem + DevicePath) and a real
+  `\NAME.EXT` FilePath node.
+- **`boot_services.rs`** rounded out significantly: `LocateHandle`/
+  `LocateHandleBuffer` (ByProtocol search), `OpenProtocol`/
+  `CloseProtocol`, `ProtocolsPerHandle`, `ReinstallProtocolInterface`/
+  `UninstallProtocolInterface` (protocol_db gained the removal/
+  enumeration primitives these need), `InstallConfigurationTable` (a
+  real small table, not a stub), `GetNextMonotonicCount`, `UnloadImage`,
+  and `SetWatchdogTimer` (pm.rs gained a real countdown-timeout path
+  alongside `reset()`'s "shortest possible timeout"). What's left
+  stubbed is stubbed for a real reason, documented in boot_services.rs:
+  `InstallMultipleProtocolInterfaces`/`Uninstall...` are genuine C
+  varargs functions Rust can call but can't *define*; `ConnectController`/
+  `DisconnectController` need a driver-binding-protocol framework Ferro
+  doesn't have.
+
+**Verification used a real, unmodified `aarch64-unknown-uefi` binary**
+(`efi-test-app/`), not another hand-crafted PE -- built by rustc's own
+UEFI target (`rustup target add aarch64-unknown-uefi`) from
+hand-written protocol structs matching the spec directly, no `uefi`
+crate dependency, so it's testing Ferro's real ABI compatibility, not
+agreement with some other Rust crate's assumptions. It calls
+`ConOut->OutputString`, `LocateProtocol(SimpleFileSystem)`,
+`OpenVolume`, `Open("TEST.TXT")`, `Read`, and `ConIn->ReadKeyStroke`,
+then returns `EFI_SUCCESS`. Loaded through the normal BOOT FROM SD
+path against a real FAT32 image, every step passed: the file read
+back the exact 42 bytes placed on the card, the keypress round-tripped
+correctly (scan_code=0, unicode_char=13, a real Enter), StartImage got
+EFI_SUCCESS back, and Ferro's own boot manager redrew correctly and
+stayed fully navigable afterward.
+
+Caught one real bug this way that a hand-crafted test never would
+have: `file_protocol.rs`'s `Open()` originally read a file into a
+**64KiB stack-local buffer**, several call frames deep (loaded EFI app
+-> its own call into `Open` -> this function) against Ferro's 64KiB
+total boot stack -- a silent hang, not a crash, since there's no stack
+guard page in this bare-metal environment. Fixed by moving that buffer
+to static storage, the same "big buffers are static, not stack"
+convention already used everywhere else in this codebase (`persist.rs`,
+`boot_efi_app`'s own load buffer). Worth remembering: this class of
+bug is invisible until something actually calls deep enough to hit it,
+which a synthetic/minimal test binary may never do.
+
 ## Next milestones
 
 1. Real Pi 3 hardware validation -- nothing here has touched physical
@@ -549,3 +642,8 @@ host side, not just by reading it back through Ferro's own driver
    physical SD slot -- would need an sdhost driver), and the
    framebuffer pixel-order fix above (only verified against QEMU's
    model, not a real VideoCore GPU).
+2. Try booting a real, external bootloader (GRUB or systemd-boot for
+   aarch64) instead of just the hand-written conformance test --
+   would likely surface gaps around subdirectory support (fat32.rs's
+   biggest remaining limitation) and any protocol those specific
+   projects lean on harder than the test app does.

@@ -12,10 +12,16 @@ pub const EFI_SUCCESS: EfiStatus = 0;
 pub const EFI_INVALID_PARAMETER: EfiStatus = ERROR_BIT | 2;
 pub const EFI_UNSUPPORTED: EfiStatus = ERROR_BIT | 3;
 pub const EFI_BUFFER_TOO_SMALL: EfiStatus = ERROR_BIT | 5;
+pub const EFI_NOT_READY: EfiStatus = ERROR_BIT | 6;
+pub const EFI_DEVICE_ERROR: EfiStatus = ERROR_BIT | 7;
+pub const EFI_WRITE_PROTECTED: EfiStatus = ERROR_BIT | 8;
 pub const EFI_OUT_OF_RESOURCES: EfiStatus = ERROR_BIT | 9;
 pub const EFI_NOT_FOUND: EfiStatus = ERROR_BIT | 14;
 
 pub type EfiHandle = *mut c_void;
+/// Opaque event token -- like EfiHandle, callers never dereference it
+/// themselves; it's just a key into events.rs's table.
+pub type EfiEvent = *mut c_void;
 
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,6 +63,13 @@ pub struct EfiMemoryDescriptor {
 }
 
 pub const EFI_MEMORY_DESCRIPTOR_VERSION: u32 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct EfiConfigurationTableEntry {
+    pub vendor_guid: EfiGuid,
+    pub vendor_table: *mut c_void,
+}
 
 #[repr(C)]
 pub struct EfiTableHeader {

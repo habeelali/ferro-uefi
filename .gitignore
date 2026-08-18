@@ -1,1 +1,3 @@
 /target
+efi-test-app/target
+efi-test-app/Cargo.lock

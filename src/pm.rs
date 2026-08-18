@@ -29,3 +29,29 @@ pub fn reset() -> ! {
         unsafe { core::arch::asm!("wfe") };
     }
 }
+
+/// Arms the watchdog for a real countdown (`timeout_seconds == 0`
+/// disarms it) rather than reset()'s "shortest possible timeout" --
+/// backs EFI_BOOT_SERVICES.SetWatchdogTimer. Same real-hardware-only
+/// caveat as reset(): QEMU's raspi3b doesn't model this SoC block, so
+/// this is a no-op there.
+pub fn set_watchdog(timeout_seconds: u64) {
+    unsafe {
+        if timeout_seconds == 0 {
+            // Disable: clear WRCFG back to "no action" so an already-
+            // running countdown doesn't still fire a reset.
+            let rstc = mmio::read(PM_RSTC);
+            mmio::write(PM_RSTC, PM_PASSWORD | (rstc & !PM_RSTC_WRCFG_MASK));
+            return;
+        }
+        // PM_WDOG's countdown field is the low 20 bits, ticking at the
+        // watchdog's ~16us period per Broadcom's documented behavior.
+        let ticks = ((timeout_seconds.saturating_mul(1_000_000)) / 16).min(0xF_FFFF) as u32;
+        mmio::write(PM_WDOG, PM_PASSWORD | ticks);
+        let rstc = mmio::read(PM_RSTC);
+        mmio::write(
+            PM_RSTC,
+            PM_PASSWORD | (rstc & !PM_RSTC_WRCFG_MASK) | PM_RSTC_WRCFG_FULL_RESET,
+        );
+    }
+}

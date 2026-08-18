@@ -5,8 +5,13 @@
 //! exactly which of the ~40 Boot Services functions are real versus
 //! stubbed.
 
+pub mod block_io;
 pub mod boot_services;
+pub mod console;
 mod crc32;
+pub mod device_path;
+pub mod events;
+pub mod file_protocol;
 pub mod memory;
 pub mod protocol_db;
 pub mod protocols;

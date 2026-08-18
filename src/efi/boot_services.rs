@@ -8,6 +8,7 @@
 //! get wired up to real logic as the code that needs them lands.
 
 use super::crc32::crc32_ieee;
+use super::events::{self, Kind};
 use super::protocol_db;
 use super::protocols::{EfiLoadedImageProtocol, LOADED_IMAGE_PROTOCOL_GUID};
 use super::types::*;
@@ -24,20 +25,50 @@ pub type AllocatePoolFn = extern "C" fn(u32, usize, *mut *mut c_void) -> EfiStat
 pub type FreePoolFn = extern "C" fn(*mut c_void) -> EfiStatus;
 pub type InstallProtocolInterfaceFn =
     extern "C" fn(*mut EfiHandle, *const EfiGuid, u32, *mut c_void) -> EfiStatus;
+pub type ReinstallProtocolInterfaceFn =
+    extern "C" fn(EfiHandle, *const EfiGuid, *mut c_void, *mut c_void) -> EfiStatus;
+pub type UninstallProtocolInterfaceFn = extern "C" fn(EfiHandle, *const EfiGuid, *mut c_void) -> EfiStatus;
 pub type HandleProtocolFn = extern "C" fn(EfiHandle, *const EfiGuid, *mut *mut c_void) -> EfiStatus;
+pub type LocateHandleFn = extern "C" fn(u32, *const EfiGuid, *mut c_void, *mut usize, *mut EfiHandle) -> EfiStatus;
+pub type LocateHandleBufferFn =
+    extern "C" fn(u32, *const EfiGuid, *mut c_void, *mut usize, *mut *mut EfiHandle) -> EfiStatus;
 pub type LocateProtocolFn = extern "C" fn(*const EfiGuid, *mut c_void, *mut *mut c_void) -> EfiStatus;
+pub type InstallConfigurationTableFn = extern "C" fn(*const EfiGuid, *mut c_void) -> EfiStatus;
 pub type LoadImageFn =
     extern "C" fn(u8, EfiHandle, *mut c_void, *mut c_void, usize, *mut EfiHandle) -> EfiStatus;
 pub type StartImageFn = extern "C" fn(EfiHandle, *mut usize, *mut *mut u16) -> EfiStatus;
+pub type UnloadImageFn = extern "C" fn(EfiHandle) -> EfiStatus;
 pub type ExitBootServicesFn = extern "C" fn(EfiHandle, usize) -> EfiStatus;
+pub type GetNextMonotonicCountFn = extern "C" fn(*mut u64) -> EfiStatus;
 pub type StallFn = extern "C" fn(usize) -> EfiStatus;
+pub type SetWatchdogTimerFn = extern "C" fn(usize, u64, usize, *mut u16) -> EfiStatus;
 pub type CopyMemFn = extern "C" fn(*mut c_void, *const c_void, usize);
 pub type SetMemFn = extern "C" fn(*mut c_void, usize, u8);
 pub type CalculateCrc32Fn = extern "C" fn(*const c_void, usize, *mut u32) -> EfiStatus;
-/// Real UEFI stub signatures vary a lot; since nothing calls through
-/// these yet (no PE/COFF loader exists to run a real EFI app), they
-/// share this placeholder shape rather than each getting the exact
-/// spec signature. Tighten as real callers show up.
+
+pub type EventNotifyFn = extern "C" fn(EfiEvent, *mut c_void);
+pub type CreateEventFn = extern "C" fn(u32, usize, Option<EventNotifyFn>, *mut c_void, *mut EfiEvent) -> EfiStatus;
+pub type CreateEventExFn =
+    extern "C" fn(u32, usize, Option<EventNotifyFn>, *const c_void, *const EfiGuid, *mut EfiEvent) -> EfiStatus;
+pub type SetTimerFn = extern "C" fn(EfiEvent, u32, u64) -> EfiStatus;
+pub type WaitForEventFn = extern "C" fn(usize, *mut EfiEvent, *mut usize) -> EfiStatus;
+pub type SignalEventFn = extern "C" fn(EfiEvent) -> EfiStatus;
+pub type CloseEventFn = extern "C" fn(EfiEvent) -> EfiStatus;
+pub type CheckEventFn = extern "C" fn(EfiEvent) -> EfiStatus;
+
+pub type OpenProtocolFn =
+    extern "C" fn(EfiHandle, *const EfiGuid, *mut *mut c_void, EfiHandle, EfiHandle, u32) -> EfiStatus;
+pub type CloseProtocolFn = extern "C" fn(EfiHandle, *const EfiGuid, EfiHandle, EfiHandle) -> EfiStatus;
+pub type ProtocolsPerHandleFn = extern "C" fn(EfiHandle, *mut *mut *const EfiGuid, *mut usize) -> EfiStatus;
+
+/// A handful of Boot Services functions are either genuinely
+/// impossible to implement in safe Rust (InstallMultipleProtocol-
+/// Interfaces is a real C varargs function -- Rust can call those but
+/// can't *define* one) or need a driver-connection model Ferro
+/// doesn't have (ConnectController and friends, since there's no
+/// generic driver-binding-protocol framework here, just hand-written
+/// device drivers). Those stay honest EFI_UNSUPPORTED stubs sharing
+/// this placeholder shape.
 pub type StubFn = extern "C" fn() -> EfiStatus;
 
 #[repr(C)]
@@ -53,42 +84,42 @@ pub struct BootServices {
     pub allocate_pool: AllocatePoolFn,
     pub free_pool: FreePoolFn,
 
-    pub create_event: StubFn,
-    pub set_timer: StubFn,
-    pub wait_for_event: StubFn,
-    pub signal_event: StubFn,
-    pub close_event: StubFn,
-    pub check_event: StubFn,
+    pub create_event: CreateEventFn,
+    pub set_timer: SetTimerFn,
+    pub wait_for_event: WaitForEventFn,
+    pub signal_event: SignalEventFn,
+    pub close_event: CloseEventFn,
+    pub check_event: CheckEventFn,
 
     pub install_protocol_interface: InstallProtocolInterfaceFn,
-    pub reinstall_protocol_interface: StubFn,
-    pub uninstall_protocol_interface: StubFn,
+    pub reinstall_protocol_interface: ReinstallProtocolInterfaceFn,
+    pub uninstall_protocol_interface: UninstallProtocolInterfaceFn,
     pub handle_protocol: HandleProtocolFn,
     pub reserved: *mut c_void,
     pub register_protocol_notify: StubFn,
-    pub locate_handle: StubFn,
+    pub locate_handle: LocateHandleFn,
     pub locate_device_path: StubFn,
-    pub install_configuration_table: StubFn,
+    pub install_configuration_table: InstallConfigurationTableFn,
 
     pub load_image: LoadImageFn,
     pub start_image: StartImageFn,
     pub exit: StubFn,
-    pub unload_image: StubFn,
+    pub unload_image: UnloadImageFn,
     pub exit_boot_services: ExitBootServicesFn,
 
-    pub get_next_monotonic_count: StubFn,
+    pub get_next_monotonic_count: GetNextMonotonicCountFn,
     pub stall: StallFn,
-    pub set_watchdog_timer: StubFn,
+    pub set_watchdog_timer: SetWatchdogTimerFn,
 
     pub connect_controller: StubFn,
     pub disconnect_controller: StubFn,
 
-    pub open_protocol: StubFn,
-    pub close_protocol: StubFn,
+    pub open_protocol: OpenProtocolFn,
+    pub close_protocol: CloseProtocolFn,
     pub open_protocol_information: StubFn,
 
-    pub protocols_per_handle: StubFn,
-    pub locate_handle_buffer: StubFn,
+    pub protocols_per_handle: ProtocolsPerHandleFn,
+    pub locate_handle_buffer: LocateHandleBufferFn,
     pub locate_protocol: LocateProtocolFn,
     pub install_multiple_protocol_interfaces: StubFn,
     pub uninstall_multiple_protocol_interfaces: StubFn,
@@ -97,7 +128,7 @@ pub struct BootServices {
 
     pub copy_mem: CopyMemFn,
     pub set_mem: SetMemFn,
-    pub create_event_ex: StubFn,
+    pub create_event_ex: CreateEventExFn,
 }
 
 unsafe impl Sync for BootServices {}
@@ -275,6 +306,41 @@ extern "C" fn install_protocol_interface(
     EFI_SUCCESS
 }
 
+extern "C" fn reinstall_protocol_interface(
+    handle: EfiHandle,
+    protocol: *const EfiGuid,
+    _old_interface: *mut c_void,
+    new_interface: *mut c_void,
+) -> EfiStatus {
+    if protocol.is_null() {
+        return EFI_INVALID_PARAMETER;
+    }
+    let Some(index) = protocol_db::index_of(handle) else {
+        return EFI_INVALID_PARAMETER;
+    };
+    let guid = unsafe { *protocol };
+    protocol_db::uninstall(index, &guid);
+    if !protocol_db::install(index, guid, new_interface) {
+        return EFI_OUT_OF_RESOURCES;
+    }
+    EFI_SUCCESS
+}
+
+extern "C" fn uninstall_protocol_interface(handle: EfiHandle, protocol: *const EfiGuid, _interface: *mut c_void) -> EfiStatus {
+    if protocol.is_null() {
+        return EFI_INVALID_PARAMETER;
+    }
+    let Some(index) = protocol_db::index_of(handle) else {
+        return EFI_INVALID_PARAMETER;
+    };
+    let guid = unsafe { *protocol };
+    if protocol_db::uninstall(index, &guid) {
+        EFI_SUCCESS
+    } else {
+        EFI_NOT_FOUND
+    }
+}
+
 extern "C" fn handle_protocol(handle: EfiHandle, protocol: *const EfiGuid, interface: *mut *mut c_void) -> EfiStatus {
     if protocol.is_null() || interface.is_null() {
         return EFI_INVALID_PARAMETER;
@@ -304,6 +370,290 @@ extern "C" fn locate_protocol(
             EFI_SUCCESS
         }
         None => EFI_NOT_FOUND,
+    }
+}
+
+/// LocateHandle search types (EFI_LOCATE_SEARCH_TYPE). Only
+/// ByProtocol is implemented for real -- AllHandles and
+/// ByRegisterNotify would need either a bigger enumeration (all,
+/// unfiltered) or the register_protocol_notify machinery this
+/// firmware doesn't have.
+const ALL_HANDLES: u32 = 0;
+const BY_PROTOCOL: u32 = 2;
+
+extern "C" fn locate_handle(
+    search_type: u32,
+    protocol: *const EfiGuid,
+    _search_key: *mut c_void,
+    buffer_size: *mut usize,
+    buffer: *mut EfiHandle,
+) -> EfiStatus {
+    if buffer_size.is_null() || search_type != BY_PROTOCOL || protocol.is_null() {
+        return EFI_INVALID_PARAMETER;
+    }
+    let guid = unsafe { *protocol };
+    let mut scratch = [core::ptr::null_mut(); protocol_db::MAX_HANDLES];
+    let count = protocol_db::handles_with(&guid, &mut scratch);
+    if count == 0 {
+        return EFI_NOT_FOUND;
+    }
+    let needed = count * core::mem::size_of::<EfiHandle>();
+    let capacity = unsafe { *buffer_size };
+    unsafe { *buffer_size = needed };
+    if capacity < needed {
+        return EFI_BUFFER_TOO_SMALL;
+    }
+    if !buffer.is_null() {
+        unsafe {
+            for (i, &h) in scratch[..count].iter().enumerate() {
+                *buffer.add(i) = h;
+            }
+        }
+    }
+    EFI_SUCCESS
+}
+
+extern "C" fn locate_handle_buffer(
+    search_type: u32,
+    protocol: *const EfiGuid,
+    search_key: *mut c_void,
+    num_handles: *mut usize,
+    buffer: *mut *mut EfiHandle,
+) -> EfiStatus {
+    if num_handles.is_null() || buffer.is_null() {
+        return EFI_INVALID_PARAMETER;
+    }
+    let mut scratch = [core::ptr::null_mut(); protocol_db::MAX_HANDLES];
+    let count = if search_type == ALL_HANDLES {
+        // No "list every handle" primitive in protocol_db (it only
+        // indexes by protocol GUID) -- approximate by taking the
+        // union of handles carrying any protocol we've ever
+        // installed, which in practice is every live handle, since
+        // find_or_create_handle always immediately installs at least
+        // one protocol on a fresh handle.
+        protocol_db::handles_with(&LOADED_IMAGE_PROTOCOL_GUID, &mut scratch)
+            + protocol_db::handles_with(&super::console::SIMPLE_TEXT_OUTPUT_PROTOCOL_GUID, &mut scratch[..])
+    } else {
+        if protocol.is_null() {
+            return EFI_INVALID_PARAMETER;
+        }
+        let guid = unsafe { *protocol };
+        protocol_db::handles_with(&guid, &mut scratch)
+    };
+    let _ = search_key;
+    if count == 0 {
+        return EFI_NOT_FOUND;
+    }
+    let pages = ((count * core::mem::size_of::<EfiHandle>()) as u64 + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE;
+    let Some(base) = super::memory::allocate_pages(pages.max(1)) else {
+        return EFI_OUT_OF_RESOURCES;
+    };
+    unsafe {
+        let out = base as *mut EfiHandle;
+        for (i, &h) in scratch[..count].iter().enumerate() {
+            *out.add(i) = h;
+        }
+        *buffer = out;
+    }
+    unsafe { *num_handles = count };
+    EFI_SUCCESS
+}
+
+extern "C" fn protocols_per_handle(
+    handle: EfiHandle,
+    protocol_buffer: *mut *mut *const EfiGuid,
+    protocol_buffer_count: *mut usize,
+) -> EfiStatus {
+    if protocol_buffer.is_null() || protocol_buffer_count.is_null() {
+        return EFI_INVALID_PARAMETER;
+    }
+    let mut scratch = [EfiGuid { data1: 0, data2: 0, data3: 0, data4: [0; 8] }; 8];
+    let Some(count) = protocol_db::protocols_on_handle(handle, &mut scratch) else {
+        return EFI_INVALID_PARAMETER;
+    };
+    if count == 0 {
+        unsafe {
+            *protocol_buffer = core::ptr::null_mut();
+            *protocol_buffer_count = 0;
+        }
+        return EFI_SUCCESS;
+    }
+    // Caller owns and must FreePool this -- an array of GUID
+    // *pointers*, per spec, not the GUIDs themselves; store the GUIDs
+    // right after the pointer array in the same allocation and point
+    // into them.
+    let ptr_bytes = count * core::mem::size_of::<*const EfiGuid>();
+    let guid_bytes = count * core::mem::size_of::<EfiGuid>();
+    let pages = ((ptr_bytes + guid_bytes) as u64 + EFI_PAGE_SIZE - 1) / EFI_PAGE_SIZE;
+    let Some(base) = super::memory::allocate_pages(pages.max(1)) else {
+        return EFI_OUT_OF_RESOURCES;
+    };
+    unsafe {
+        let guids_out = (base as *mut u8).add(ptr_bytes) as *mut EfiGuid;
+        let ptrs_out = base as *mut *const EfiGuid;
+        for i in 0..count {
+            *guids_out.add(i) = scratch[i];
+            *ptrs_out.add(i) = guids_out.add(i);
+        }
+        *protocol_buffer = ptrs_out;
+        *protocol_buffer_count = count;
+    }
+    EFI_SUCCESS
+}
+
+extern "C" fn open_protocol(
+    handle: EfiHandle,
+    protocol: *const EfiGuid,
+    interface: *mut *mut c_void,
+    _agent_handle: EfiHandle,
+    _controller_handle: EfiHandle,
+    _attributes: u32,
+) -> EfiStatus {
+    // No open-reference-counting/usage-agent bookkeeping -- delegates
+    // straight to HandleProtocol, which covers the overwhelmingly
+    // common BY_HANDLE_PROTOCOL usage pattern real apps rely on.
+    handle_protocol(handle, protocol, interface)
+}
+
+extern "C" fn close_protocol(_handle: EfiHandle, _protocol: *const EfiGuid, _agent_handle: EfiHandle, _controller_handle: EfiHandle) -> EfiStatus {
+    EFI_SUCCESS // nothing to release: open_protocol never took a reference
+}
+
+const MAX_CONFIG_TABLE_ENTRIES: usize = 8;
+static mut CONFIG_TABLE: [EfiConfigurationTableEntry; MAX_CONFIG_TABLE_ENTRIES] = [EfiConfigurationTableEntry {
+    vendor_guid: EfiGuid { data1: 0, data2: 0, data3: 0, data4: [0; 8] },
+    vendor_table: core::ptr::null_mut(),
+}; MAX_CONFIG_TABLE_ENTRIES];
+static CONFIG_TABLE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+extern "C" fn install_configuration_table(guid: *const EfiGuid, table: *mut c_void) -> EfiStatus {
+    if guid.is_null() {
+        return EFI_INVALID_PARAMETER;
+    }
+    let g = unsafe { *guid };
+    let entries = unsafe { &mut *core::ptr::addr_of_mut!(CONFIG_TABLE) };
+    let count = CONFIG_TABLE_COUNT.load(Ordering::Relaxed);
+
+    if let Some(existing) = entries[..count].iter_mut().find(|e| e.vendor_guid == g) {
+        if table.is_null() {
+            // Remove: shift the tail down over it.
+            let idx = (existing as *mut EfiConfigurationTableEntry as usize
+                - entries.as_ptr() as usize)
+                / core::mem::size_of::<EfiConfigurationTableEntry>();
+            entries.copy_within(idx + 1..count, idx);
+            CONFIG_TABLE_COUNT.store(count - 1, Ordering::Relaxed);
+        } else {
+            existing.vendor_table = table;
+        }
+    } else {
+        if table.is_null() {
+            return EFI_NOT_FOUND;
+        }
+        if count >= MAX_CONFIG_TABLE_ENTRIES {
+            return EFI_OUT_OF_RESOURCES;
+        }
+        entries[count] = EfiConfigurationTableEntry { vendor_guid: g, vendor_table: table };
+        CONFIG_TABLE_COUNT.store(count + 1, Ordering::Relaxed);
+    }
+
+    let st = unsafe { &mut *core::ptr::addr_of_mut!(super::system_table::SYSTEM_TABLE) };
+    st.configuration_table = entries.as_mut_ptr() as *mut c_void;
+    st.number_of_table_entries = CONFIG_TABLE_COUNT.load(Ordering::Relaxed);
+    EFI_SUCCESS
+}
+
+static MONOTONIC_COUNT: AtomicU64 = AtomicU64::new(0);
+
+extern "C" fn get_next_monotonic_count(count: *mut u64) -> EfiStatus {
+    if count.is_null() {
+        return EFI_INVALID_PARAMETER;
+    }
+    unsafe { *count = MONOTONIC_COUNT.fetch_add(1, Ordering::Relaxed) };
+    EFI_SUCCESS
+}
+
+extern "C" fn set_watchdog_timer(timeout: usize, _watchdog_code: u64, _data_size: usize, _watchdog_data: *mut u16) -> EfiStatus {
+    crate::pm::set_watchdog(timeout as u64);
+    EFI_SUCCESS
+}
+
+extern "C" fn unload_image(image_handle: EfiHandle) -> EfiStatus {
+    let Some(index) = protocol_db::index_of(image_handle) else {
+        return EFI_INVALID_PARAMETER;
+    };
+    let li = unsafe { &(*core::ptr::addr_of!(LOADED_IMAGE_PROTOCOLS))[index] };
+    match li.unload {
+        Some(f) => f(image_handle),
+        None => EFI_UNSUPPORTED,
+    }
+}
+
+extern "C" fn create_event(
+    event_type: u32,
+    _notify_tpl: usize,
+    notify_function: Option<EventNotifyFn>,
+    notify_context: *mut c_void,
+    event: *mut EfiEvent,
+) -> EfiStatus {
+    if event.is_null() {
+        return EFI_INVALID_PARAMETER;
+    }
+    let kind = if event_type & events::EVT_TIMER != 0 { Kind::Timer } else { Kind::Generic };
+    match events::create(kind, notify_function, notify_context) {
+        Some(e) => {
+            unsafe { *event = e };
+            EFI_SUCCESS
+        }
+        None => EFI_OUT_OF_RESOURCES,
+    }
+}
+
+extern "C" fn create_event_ex(
+    event_type: u32,
+    notify_tpl: usize,
+    notify_function: Option<EventNotifyFn>,
+    notify_context: *const c_void,
+    _event_group: *const EfiGuid,
+    event: *mut EfiEvent,
+) -> EfiStatus {
+    // Event groups aren't tracked (no other code signals a group of
+    // events together yet) -- functionally the same as CreateEvent.
+    create_event(event_type, notify_tpl, notify_function, notify_context as *mut c_void, event)
+}
+
+extern "C" fn set_timer(event: EfiEvent, timer_type: u32, trigger_time: u64) -> EfiStatus {
+    events::set_timer(event, timer_type, trigger_time)
+}
+
+extern "C" fn signal_event(event: EfiEvent) -> EfiStatus {
+    events::signal(event)
+}
+
+extern "C" fn close_event(event: EfiEvent) -> EfiStatus {
+    events::close(event)
+}
+
+extern "C" fn check_event(event: EfiEvent) -> EfiStatus {
+    events::check(event)
+}
+
+extern "C" fn wait_for_event(number_of_events: usize, event: *mut EfiEvent, index: *mut usize) -> EfiStatus {
+    if event.is_null() || index.is_null() || number_of_events == 0 {
+        return EFI_INVALID_PARAMETER;
+    }
+    let mut scratch = [core::ptr::null_mut(); 8];
+    if number_of_events > scratch.len() {
+        return EFI_INVALID_PARAMETER;
+    }
+    for i in 0..number_of_events {
+        scratch[i] = unsafe { *event.add(i) };
+    }
+    match events::wait(&scratch[..number_of_events]) {
+        Ok(i) => {
+            unsafe { *index = i };
+            EFI_SUCCESS
+        }
+        Err(e) => e,
     }
 }
 
@@ -445,42 +795,42 @@ pub static mut BOOT_SERVICES: BootServices = BootServices {
     allocate_pool,
     free_pool,
 
-    create_event: stub,
-    set_timer: stub,
-    wait_for_event: stub,
-    signal_event: stub,
-    close_event: stub,
-    check_event: stub,
+    create_event,
+    set_timer,
+    wait_for_event,
+    signal_event,
+    close_event,
+    check_event,
 
     install_protocol_interface,
-    reinstall_protocol_interface: stub,
-    uninstall_protocol_interface: stub,
+    reinstall_protocol_interface,
+    uninstall_protocol_interface,
     handle_protocol,
     reserved: core::ptr::null_mut(),
     register_protocol_notify: stub,
-    locate_handle: stub,
+    locate_handle,
     locate_device_path: stub,
-    install_configuration_table: stub,
+    install_configuration_table,
 
     load_image,
     start_image,
     exit: stub,
-    unload_image: stub,
+    unload_image,
     exit_boot_services,
 
-    get_next_monotonic_count: stub,
+    get_next_monotonic_count,
     stall,
-    set_watchdog_timer: stub,
+    set_watchdog_timer,
 
     connect_controller: stub,
     disconnect_controller: stub,
 
-    open_protocol: stub,
-    close_protocol: stub,
+    open_protocol,
+    close_protocol,
     open_protocol_information: stub,
 
-    protocols_per_handle: stub,
-    locate_handle_buffer: stub,
+    protocols_per_handle,
+    locate_handle_buffer,
     locate_protocol,
     install_multiple_protocol_interfaces: stub,
     uninstall_multiple_protocol_interfaces: stub,
@@ -489,7 +839,7 @@ pub static mut BOOT_SERVICES: BootServices = BootServices {
 
     copy_mem,
     set_mem,
-    create_event_ex: stub,
+    create_event_ex,
 };
 
 /// Sets the header signature and computes a real CRC32 over the table

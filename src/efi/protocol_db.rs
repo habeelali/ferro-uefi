@@ -127,3 +127,63 @@ pub fn handle_protocol(handle: *mut c_void, guid: &EfiGuid) -> Option<*mut c_voi
     }
     None
 }
+
+/// Removes `guid` from `index`'s handle, for ReinstallProtocolInterface
+/// (uninstall-then-install) and UninstallProtocolInterface. Returns
+/// false if that handle didn't have `guid` installed.
+pub fn uninstall(index: usize, guid: &EfiGuid) -> bool {
+    let handles = core::ptr::addr_of_mut!(HANDLES);
+    unsafe {
+        for slot in (*handles)[index].protocols.iter_mut() {
+            if matches!(slot, Some(p) if p.guid == *guid) {
+                *slot = None;
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Every live handle (in table order) that has `guid` installed,
+/// written into `out` -- returns the count found, capped at `out`'s
+/// length (real callers size `out` from a first LocateHandle call
+/// that reports the needed count via EFI_BUFFER_TOO_SMALL).
+pub fn handles_with(guid: &EfiGuid, out: &mut [*mut c_void]) -> usize {
+    let handles = core::ptr::addr_of!(HANDLES);
+    let mut count = 0;
+    unsafe {
+        for (i, h) in (*handles).iter().enumerate() {
+            if !h.in_use {
+                continue;
+            }
+            if h.protocols.iter().flatten().any(|p| p.guid == *guid) {
+                if count < out.len() {
+                    out[count] = index_to_handle(i);
+                }
+                count += 1;
+            }
+        }
+    }
+    count
+}
+
+/// Every protocol GUID installed on `handle`, written into `out` --
+/// returns the count found (capped at `out`'s length), or None if
+/// `handle` isn't a live handle at all.
+pub fn protocols_on_handle(handle: *mut c_void, out: &mut [EfiGuid]) -> Option<usize> {
+    let index = handle_to_index(handle)?;
+    let handles = core::ptr::addr_of!(HANDLES);
+    unsafe {
+        if !(*handles)[index].in_use {
+            return None;
+        }
+        let mut count = 0;
+        for p in (*handles)[index].protocols.iter().flatten() {
+            if count < out.len() {
+                out[count] = p.guid;
+            }
+            count += 1;
+        }
+        Some(count)
+    }
+}

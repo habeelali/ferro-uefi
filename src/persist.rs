@@ -58,6 +58,13 @@ pub fn set_context(card: Card, fs: Fat32) {
     unsafe { *core::ptr::addr_of_mut!(SD_CONTEXT) = Some((card, fs)) };
 }
 
+/// The same cached card/filesystem, for other code (efi::block_io,
+/// efi::file_protocol) that needs real disk access on behalf of a
+/// loaded EFI application without re-running SD init + FAT32 mount.
+pub fn get_context() -> Option<(Card, Fat32)> {
+    unsafe { *core::ptr::addr_of!(SD_CONTEXT) }
+}
+
 /// Best-effort auto-save of the live variable store, used right after
 /// a NON_VOLATILE SetVariable call. Does nothing (silently) if no SD
 /// context has been established yet this session -- this is a

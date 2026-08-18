@@ -1,0 +1,19 @@
+[package]
+name = "ferro-efi-test"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ferro-efi-test"
+path = "src/main.rs"
+test = false
+bench = false
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "z"
+
+[workspace]

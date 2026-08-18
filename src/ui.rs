@@ -782,20 +782,55 @@ fn boot_from_sd(fb: &Framebuffer, uart: &mut Uart, keyboard: &mut Option<Keyboar
         fb.draw_text(CONTENT_X + 20, y, name, 2, FG);
         fb.flush();
         writeln!(uart, "\n  EFI application found: {name}").ok();
-        boot_efi_app(fb, uart, &fs, &card, &names[i], y);
+        boot_efi_app(fb, uart, keyboard, &fs, &card, &names[i], y);
     }
 
     fb.flush();
     wait_for_key(uart, keyboard);
 }
 
+/// The SD card's block/filesystem handle -- EFI_BLOCK_IO_PROTOCOL,
+/// EFI_SIMPLE_FILE_SYSTEM_PROTOCOL, and EFI_DEVICE_PATH_PROTOCOL, all
+/// installed once and reused across however many .efi apps get
+/// loaded this session (repeating LoadImage/StartImage shouldn't leak
+/// a fresh protocol_db handle every time).
+static mut SD_HANDLE: Option<crate::efi::types::EfiHandle> = None;
+
+fn sd_handle() -> crate::efi::types::EfiHandle {
+    use crate::efi::{block_io, device_path, file_protocol, protocol_db};
+    unsafe {
+        if let Some(h) = SD_HANDLE {
+            return h;
+        }
+        let index = protocol_db::find_or_create_handle(core::ptr::null_mut())
+            .expect("protocol_db has room for the SD handle");
+        block_io::install(index);
+        file_protocol::install(index);
+        protocol_db::install(index, device_path::DEVICE_PATH_PROTOCOL_GUID, device_path::sd_device_path());
+        let h = protocol_db::handle_for_index(index);
+        SD_HANDLE = Some(h);
+        h
+    }
+}
+
 /// Reads a `.EFI` file into a static load buffer and runs it through
 /// the real EFI_BOOT_SERVICES table -- LoadImage (PE/COFF parse +
 /// relocate), HandleProtocol (fetch EFI_LOADED_IMAGE_PROTOCOL back to
-/// independently cross-check what LoadImage did), then StartImage
-/// (call the entry point with (ImageHandle, SystemTable*) and get its
-/// EFI_STATUS back).
-fn boot_efi_app(fb: &Framebuffer, uart: &mut Uart, fs: &Fat32, card: &Card, name: &[u8; 11], mut y: u32) {
+/// independently cross-check what LoadImage did and wire in its
+/// DeviceHandle/FilePath), then StartImage (call the entry point with
+/// (ImageHandle, SystemTable*) and get its EFI_STATUS back). Also
+/// wires up the EFI console (ConOut/ConIn) to the same UART/USB-HID
+/// input this menu itself uses, so the started image can actually
+/// print and read keys, not just call into memory/protocol services.
+fn boot_efi_app(
+    fb: &Framebuffer,
+    uart: &mut Uart,
+    keyboard: &mut Option<Keyboard>,
+    fs: &Fat32,
+    card: &Card,
+    name: &[u8; 11],
+    mut y: u32,
+) {
     use crate::efi::boot_services::BOOT_SERVICES;
     use crate::efi::protocols::{EfiLoadedImageProtocol, LOADED_IMAGE_PROTOCOL_GUID};
     use crate::efi::system_table::SYSTEM_TABLE;
@@ -845,13 +880,20 @@ fn boot_efi_app(fb: &Framebuffer, uart: &mut Uart, fs: &Fat32, card: &Card, name
     let mut iface: *mut c_void = core::ptr::null_mut();
     let status = (bs.handle_protocol)(image_handle, &LOADED_IMAGE_PROTOCOL_GUID, &mut iface);
     if status == EFI_SUCCESS && !iface.is_null() {
-        let li = unsafe { &*(iface as *const EfiLoadedImageProtocol) };
+        let li = unsafe { &mut *(iface as *mut EfiLoadedImageProtocol) };
         writeln!(
             uart,
             "  HandleProtocol(LOADED_IMAGE) -> base={:p} size={}",
             li.image_base, li.image_size
         )
         .ok();
+
+        // Real DeviceHandle/FilePath instead of null -- an app asking
+        // "what volume/file am I" (SimpleFileSystem lookups relative
+        // to itself, config-file-next-to-the-binary patterns, etc.)
+        // gets a real answer.
+        li.device_handle = sd_handle();
+        li.file_path = crate::efi::device_path::build_file_path(name);
     }
 
     writeln!(
@@ -864,6 +906,16 @@ fn boot_efi_app(fb: &Framebuffer, uart: &mut Uart, fs: &Fat32, card: &Card, name
     y += line_height(2);
     fb.draw_text(CONTENT_X + 20, y, "STARTING IMAGE (OUTPUT BELOW IS FROM THE APP ITSELF):", 2, DIM);
     fb.flush();
+
+    // Wire ConOut/ConIn to this same UART and (if present) USB
+    // keyboard before handing control over -- must happen right
+    // before StartImage, not earlier, since it repaints the whole
+    // screen as a text console.
+    crate::efi::console::init(
+        fb as *const Framebuffer,
+        uart as *mut Uart,
+        keyboard.as_mut().map_or(core::ptr::null_mut(), |k| k as *mut Keyboard),
+    );
 
     writeln!(uart, "  --- entering StartImage ---").ok();
     let mut exit_data_size: usize = 0;

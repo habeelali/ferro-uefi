@@ -69,6 +69,29 @@ impl Framebuffer {
         self.fill_rect(0, 0, self.width, self.height, color);
     }
 
+    /// Shifts the whole framebuffer's contents up by `rows_px` pixel
+    /// rows (a raw, overlap-safe memmove -- the pitch/bpp-scaled
+    /// equivalent of a text terminal's scroll), filling the newly
+    /// exposed bottom strip with `bg`. Used by the EFI console
+    /// (efi::console) to scroll text the way a real terminal does
+    /// instead of wrapping or clearing on overflow.
+    pub fn scroll_up(&self, rows_px: u32, bg: u32) {
+        if rows_px >= self.height {
+            self.clear(bg);
+            return;
+        }
+        let bytes_per_row = self.pitch as usize;
+        let move_rows = self.height - rows_px;
+        unsafe {
+            core::ptr::copy(
+                self.ptr.add(rows_px as usize * bytes_per_row),
+                self.ptr,
+                move_rows as usize * bytes_per_row,
+            );
+        }
+        self.fill_rect(0, move_rows, self.width, rows_px, bg);
+    }
+
     /// Draws a `thickness`-pixel border around the given rectangle
     /// (the border is inside the rectangle's bounds, not outside).
     pub fn draw_rect_outline(&self, x: u32, y: u32, w: u32, h: u32, thickness: u32, color: u32) {
