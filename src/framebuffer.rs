@@ -11,7 +11,15 @@ const TAG_ALLOCATE_BUFFER: u32 = 0x0004_0001;
 const TAG_GET_PITCH: u32 = 0x0004_0008;
 const TAG_END: u32 = 0;
 
-const PIXEL_ORDER_RGB: u32 = 1;
+// Empirically (screendump pixel sampling against known 0xRRGGBB
+// constants), requesting "RGB" (1) here actually yields a framebuffer
+// where the first byte is blue -- i.e. BGR order -- both under QEMU's
+// raspi3b model. Requesting 0 instead makes the mailbox's own pixel-
+// order tag match how put_pixel()/draw_text() already pack colors, so
+// named colors (e.g. ERROR = reddish 0xFF5040) actually render as that
+// hue instead of showing up swapped (which is what every color in this
+// codebase was silently doing before this was caught).
+const PIXEL_ORDER_RGB: u32 = 0;
 
 /// GPU responses carry a bus address aliased into one of its four
 /// cache-domain views (see mailbox.rs); the low 30 bits are the real

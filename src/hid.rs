@@ -182,6 +182,26 @@ pub fn keycode_to_menu_bytes(code: u8, out: &mut [u8; 3]) -> usize {
             out[2] = b'A'; // Up arrow
             3
         }
+        0x50 => {
+            out[0] = 0x1B;
+            out[1] = b'[';
+            out[2] = b'D'; // Left arrow
+            3
+        }
+        0x4F => {
+            out[0] = 0x1B;
+            out[1] = b'[';
+            out[2] = b'C'; // Right arrow
+            3
+        }
+        0x29 => {
+            out[0] = 0x08; // Escape -> Back
+            1
+        }
+        0x2A => {
+            out[0] = 0x7F; // Backspace -> Back
+            1
+        }
         _ => 0,
     }
 }

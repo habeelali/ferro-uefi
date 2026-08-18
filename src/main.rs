@@ -22,6 +22,7 @@ mod pe;
 mod persist;
 mod pm;
 mod sd;
+mod settings;
 mod timer;
 mod uart;
 mod ui;

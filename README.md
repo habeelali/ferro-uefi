@@ -298,7 +298,10 @@ milestone 1: core0 -> EL1 -> UART online
 - `src/mailbox.rs` -- VideoCore property-tag mailbox protocol.
 - `src/framebuffer.rs` -- framebuffer allocation + pixel/rect/text drawing.
 - `src/font.rs` -- 5x7 bitmap font (just the glyphs the UI uses).
-- `src/ui.rs` -- boot log, splash screen, boot menu (UART-driven navigation).
+- `src/ui.rs` -- boot log, splash screen, two-pane boot manager + settings
+  screen, driven by UART and/or USB HID.
+- `src/settings.rs` -- setup options (verbose boot, accent theme, USB
+  enable) backed by real UEFI variables, not UI-only state.
 - `src/pm.rs` -- BCM2837 power management (watchdog reset).
 - `src/sd.rs` -- SDHCI SD card driver, read+write (see milestone 8's real-vs-emulated caveat).
 - `src/fat32.rs` -- read-only FAT32: mount, list root, read file by name.
@@ -387,14 +390,10 @@ avoid this. If a future change moves Rust execution earlier in the EL
 chain (e.g. skips through EL2 without landing in `el1_entry`), make
 sure this still happens before the first `bl` into Rust.
 
-## Milestone 14 (in progress): USB (dwc2) host + HID keyboard
+## Milestone 14 (done): USB (dwc2) host + HID keyboard
 
-The largest single piece of register-level work in the project so
-far, and the most honest write-up needs to say plainly: **the core
-driver is real and verified; the interactive menu integration has a
-known bug that isn't fixed yet.**
+The largest single piece of register-level work in the project so far.
 
-What's solid and independently verified:
 - `usb.rs`: a DWC2 (BCM2837's USB 2.0 host controller) driver --
   core reset, forced host mode, root port power/reset with speed
   detection, and control transfers. First attempt used slave/FIFO-mode
@@ -413,33 +412,81 @@ What's solid and independently verified:
 - `hid.rs`: hub traversal (SET_ADDRESS, hub descriptor, per-port
   power+reset+status) to reach a downstream HID boot-protocol
   keyboard, its own enumeration (SET_ADDRESS, configuration descriptor
-  parse, SET_CONFIGURATION), and interrupt-endpoint polling. Verified
-  by injecting real keypresses through QEMU's monitor (`sendkey a`,
-  `sendkey b`) during a dedicated polling window and getting back
-  `keydown 0x04`, `keydown 0x05` -- the exact USB HID usage-table
-  keycodes for 'a' and 'b', byte-for-byte matching what was sent.
+  parse, SET_CONFIGURATION), and interrupt-endpoint polling.
 
-What's not working yet: wiring that same polling into the interactive
-boot menu (`ui.rs`'s `run()` loop, alongside the existing UART input
-path). Screendump-verified that a `sendkey j` sent while the menu is
-up does not move the selection, even after several seconds -- ruling
-out a timing race. One suspected cause (calling `usb::init()` twice --
-once in a boot-time smoke test, again inside `run()`) was tried and
-ruled out; the actual cause is still open. The boot-time smoke test
-was trimmed back to just a core-ID register read specifically so it
-can't interfere with `run()`'s own enumeration while this gets sorted
-out. UART-driven menu navigation is completely unaffected either way.
+The interactive menu integration looked broken for a while (a
+`sendkey j` sent over QEMU's monitor while the menu was up didn't move
+the selection). Root cause turned out to be the *test harness*, not
+the driver: verification used a fixed few-second sleep before sending
+the key, racing actual (host-load-dependent) QEMU boot time. Once the
+test waited for the real "USB HID keyboard connected" UART line before
+sending a key, every press landed correctly and 1000s of polls/sec
+were measured against `poll_new_keys()`. Screendump-verified the
+on-screen highlight moving row-by-row on repeated presses. UART-driven
+navigation is unaffected either way, and now both input paths also
+drive every sub-screen ("press any key to return" included), not just
+the main menu.
+
+## Milestone 15 (done): setup UI overhaul + real settings
+
+The boot menu was functionally fine but visually and functionally
+thin: four items, one giant font size, nothing configurable, no live
+system data. This pass:
+
+- **Two-pane boot manager**: a menu list on the left, a live "SYSTEM
+  STATUS" panel on the right (uptime, CPU/EL, timer frequency, MMU
+  state, input device, accent theme, NVRAM usage) that keeps updating
+  on an idle redraw timer even when nothing's being pressed, not just
+  when the selection moves.
+- **Real settings, not UI-only toggles** (`settings.rs`): Verbose Boot
+  Log, Accent Theme, and USB HID Keyboard are backed by actual UEFI
+  variables through the same `efi::variables` store GetVariable/
+  SetVariable use -- changing one in the SETTINGS screen calls
+  `variables::set()` directly, and "SAVE VARIABLES TO SD" persists it
+  for real, since `persist.rs` serializes every in-use variable
+  regardless of which code created it. Round-trip verified: toggle
+  Verbose Boot off and Accent Theme to Green, save, then BOOT FROM SD
+  (which re-merges persisted variables into the live store and
+  re-syncs the settings cache) and confirm the SETTINGS screen still
+  shows OFF/GREEN.
+  - Verbose Boot Log toggles the boot log's real inter-line delay
+    (`LINE_DELAY_TICKS`), not a cosmetic flag.
+  - Accent Theme (Amber/Cyan/Green) recolors the whole UI immediately.
+  - USB HID Keyboard, when disabled, skips `usb::init()` entirely on
+    the next boot -- an actually-testable effect, not a stub.
+- **Smaller, denser fonts** for menu/body text (scale 2 instead of 3)
+  now that there's real content to lay out instead of four oversized
+  labels; the splash screen keeps its large logo treatment since
+  that's a one-time title screen, not a working UI.
+- **SYSTEM INFO** now renders live register values on the framebuffer
+  itself (MIDR_EL1, exception level, CNTFRQ_EL0, USB/NVRAM status)
+  instead of a static summary plus "see UART log."
+- **Found and fixed a real color bug** while adding the theme system:
+  the mailbox framebuffer request was asking VideoCore for RGB pixel
+  order (`TAG_SET_PIXEL_ORDER` = 1) but the actual memory layout
+  QEMU's raspi3b model exposes for that tag value is BGR -- confirmed
+  by sampling screendump pixels against known `0xRRGGBB` constants
+  (e.g. `SELECT_BG = 0x2A3A4A` was rendering as `(74, 58, 42)`, the
+  exact channel-reversed value). Every named color in the UI --
+  including the "amber" accent that had been silently rendering blue
+  since milestone 6 -- had been swapped the whole time. Fixed by
+  requesting pixel order 0 instead; verified all three accent themes
+  now render their actual intended hues.
+- Added missing font glyphs (`. , ' ( ) + _ %`) that several existing
+  UI strings were already relying on without anyone noticing they
+  rendered as blank squares (e.g. "WHAT'S ON IT", "(FULL TEXT OVER
+  UART)").
 
 ## Next milestones
 
-1. Root-cause and fix the USB HID -> boot menu integration bug
-   described above.
-2. Automatic variable persistence (save on `SetVariable` with the
+1. Automatic variable persistence (save on `SetVariable` with the
    NON_VOLATILE attribute, rather than only via the explicit menu
    item) and FAT32 write support, so saved state doesn't depend on a
    private, non-standard corner of the reserved sectors.
-3. Real Pi 3 hardware validation -- nothing here has touched physical
-   hardware yet, and there are two known gaps waiting there: the
-   pm.rs reset sequence (right code, unverified effect) and sd.rs's
+2. Real Pi 3 hardware validation -- nothing here has touched physical
+   hardware yet, and there are three known gaps waiting there: the
+   pm.rs reset sequence (right code, unverified effect), sd.rs's
    controller choice (right controller for QEMU, wrong one for the
-   physical SD slot -- would need an sdhost driver).
+   physical SD slot -- would need an sdhost driver), and the
+   framebuffer pixel-order fix above (only verified against QEMU's
+   model, not a real VideoCore GPU).
