@@ -15,7 +15,7 @@ const FERRO_SETTINGS_GUID: EfiGuid = EfiGuid {
     data1: 0x4645_5252,
     data2: 0x4F00,
     data3: 0x0001,
-    data4: [b'f', b'e', b'r', b'r', b'o', b'-', b's', b'u'],
+    data4: *b"ferro-su",
 };
 
 const ATTR: u32 = 0x7; // NON_VOLATILE | BOOTSERVICE_ACCESS | RUNTIME_ACCESS

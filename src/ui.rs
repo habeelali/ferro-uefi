@@ -271,7 +271,7 @@ fn draw_status_panel(fb: &Framebuffer, keyboard: &Option<Keyboard>) {
     } else {
         "INPUT    UART ONLY (USB DISABLED)"
     };
-    fb.draw_text(x, y, input_line, 2, keyboard.is_some().then_some(FG).unwrap_or(DIM));
+    fb.draw_text(x, y, input_line, 2, if keyboard.is_some() { FG } else { DIM });
     y += line_height(2);
 
     let mut lb = LineBuf::new();

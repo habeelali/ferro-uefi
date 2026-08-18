@@ -225,7 +225,7 @@ impl Fat32 {
     /// extending the root directory with a new cluster if every
     /// existing entry slot is taken.
     pub fn write_file(&self, card: &Card, name_8_3: &[u8; 11], data: &[u8]) -> Result<(), Fat32Error> {
-        let clusters_needed = (((data.len() + self.cluster_size_bytes() - 1) / self.cluster_size_bytes()).max(1)) as u32;
+        let clusters_needed = data.len().div_ceil(self.cluster_size_bytes()).max(1) as u32;
 
         let mut found: Option<(u32, usize, u32)> = None; // (sector lba, offset, old first cluster)
         let mut free_slot: Option<(u32, usize)> = None;
