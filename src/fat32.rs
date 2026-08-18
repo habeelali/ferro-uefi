@@ -1,17 +1,20 @@
-//! Minimal FAT32: mount an MBR-partitioned FAT32 volume, list the
-//! root directory, and read/write a named file's contents by walking
-//! (and, for writes, allocating/truncating) its cluster chain in the
-//! FAT. Long-filename entries are skipped (not parsed) -- files are
+//! Minimal FAT32: mount an MBR-partitioned FAT32 volume, list a
+//! directory (root or, via `resolve`, any subdirectory), and
+//! read/write a named file's contents by walking (and, for writes,
+//! allocating/truncating) its cluster chain in the FAT.
+//! Long-filename entries are skipped (not parsed) -- files are
 //! matched and listed by their 8.3 short name only. Write support
 //! covers exactly what a root-directory data file needs: create,
-//! overwrite, grow, and shrink -- no subdirectories, no long names,
-//! no deletion.
+//! overwrite, grow, and shrink -- reading walks into subdirectories
+//! fine, but writing/creating stays root-only (no subdirectory
+//! creation, no deletion).
 
 use crate::sd::{Card, SdError};
 
 const SECTOR_SIZE: usize = 512;
 const END_OF_CHAIN: u32 = 0x0FFF_FFF8;
 const ATTR_ARCHIVE: u8 = 0x20;
+const ATTR_DIRECTORY: u8 = 0x10;
 
 #[derive(Debug)]
 pub enum Fat32Error {
@@ -325,13 +328,22 @@ impl Fat32 {
     /// Lists root-directory entries (8.3 names, directories included)
     /// into `names`/`sizes`, returning how many were found (capped at
     /// the slices' length).
-    pub fn list_root(
+    pub fn list_root(&self, card: &Card, names: &mut [[u8; 11]], sizes: &mut [u32]) -> Result<usize, Fat32Error> {
+        self.list_dir(card, self.root_cluster, names, sizes)
+    }
+
+    /// Lists any directory's entries (8.3 names, subdirectories
+    /// included) by its first cluster -- `list_root` is just this
+    /// called with `self.root_cluster`. Get a subdirectory's cluster
+    /// via `resolve`.
+    pub fn list_dir(
         &self,
         card: &Card,
+        dir_cluster: u32,
         names: &mut [[u8; 11]],
         sizes: &mut [u32],
     ) -> Result<usize, Fat32Error> {
-        let mut cluster = self.root_cluster;
+        let mut cluster = dir_cluster;
         let mut count = 0usize;
         loop {
             let lba = self.cluster_to_lba(cluster);
@@ -361,23 +373,20 @@ impl Fat32 {
         Ok(count)
     }
 
-    /// Reads a root-directory file's contents into `out`, matched by
-    /// raw 8.3 name (e.g. `b"README  TXT"`, space-padded). Returns
-    /// the byte count actually written (truncated to `out.len()` if
-    /// the file is larger).
-    pub fn read_file(&self, card: &Card, name_8_3: &[u8; 11], out: &mut [u8]) -> Result<usize, Fat32Error> {
-        let mut cluster = self.root_cluster;
-        let mut first_cluster = 0u32;
-        let mut file_size = 0u32;
-
-        'search: loop {
+    /// Searches one directory's cluster chain for `name_8_3`,
+    /// returning (first_cluster, size, is_directory) if found. The
+    /// shared primitive both `resolve` (path walking) and the
+    /// existing root-only `write_file`'s search logic build on.
+    fn find_in_dir(&self, card: &Card, dir_cluster: u32, name_8_3: &[u8; 11]) -> Result<(u32, u32, bool), Fat32Error> {
+        let mut cluster = dir_cluster;
+        loop {
             let lba = self.cluster_to_lba(cluster);
             for s in 0..self.sectors_per_cluster as u32 {
                 let mut sector = [0u8; SECTOR_SIZE];
                 card.read_block(lba + s, &mut sector)?;
                 for entry in sector.chunks_exact(32) {
                     if entry[0] == 0x00 {
-                        break 'search;
+                        return Err(Fat32Error::NotFound);
                     }
                     if entry[0] == 0xE5 || entry[11] == 0x0F || entry[11] & 0x08 != 0 {
                         continue;
@@ -385,23 +394,56 @@ impl Fat32 {
                     if &entry[0..11] == name_8_3 {
                         let hi = u16::from_le_bytes([entry[20], entry[21]]) as u32;
                         let lo = u16::from_le_bytes([entry[26], entry[27]]) as u32;
-                        first_cluster = (hi << 16) | lo;
-                        file_size = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]);
-                        break 'search;
+                        let first_cluster = (hi << 16) | lo;
+                        let size = u32::from_le_bytes([entry[28], entry[29], entry[30], entry[31]]);
+                        let is_dir = entry[11] & ATTR_DIRECTORY != 0;
+                        return Ok((first_cluster, size, is_dir));
                     }
                 }
             }
             let next = self.fat_entry(card, cluster)?;
             if next >= END_OF_CHAIN {
-                break;
+                return Err(Fat32Error::NotFound);
             }
             cluster = next;
         }
+    }
 
-        if first_cluster == 0 {
-            return Err(Fat32Error::NotFound);
+    /// The root cluster, for callers (efi::file_protocol) that need
+    /// to tell "the root directory" apart from an arbitrary
+    /// subdirectory cluster without their own separate bookkeeping.
+    pub fn root_cluster(&self) -> u32 {
+        self.root_cluster
+    }
+
+    /// Resolves a `\`-separated path (e.g. `EFI\BOOT\BOOTAA64.EFI`,
+    /// no leading slash, each component an 8.3 name) starting from
+    /// `start_cluster` (the root cluster, or any subdirectory's, for
+    /// EFI_FILE_PROTOCOL.Open's "relative to `this`" semantics),
+    /// walking into subdirectories as needed. Returns the final
+    /// component's (first_cluster, size, is_directory); an empty path
+    /// resolves to `start_cluster` itself.
+    pub fn resolve_from(&self, card: &Card, start_cluster: u32, path: &[u8]) -> Result<(u32, u32, bool), Fat32Error> {
+        let mut dir_cluster = start_cluster;
+        let mut result = (start_cluster, 0u32, true);
+        for component in path.split(|&b| b == b'\\').filter(|c| !c.is_empty()) {
+            let name = to_8_3(component).ok_or(Fat32Error::NotFound)?;
+            let (first_cluster, size, is_dir) = self.find_in_dir(card, dir_cluster, &name)?;
+            result = (first_cluster, size, is_dir);
+            if is_dir {
+                dir_cluster = if first_cluster == 0 { self.root_cluster } else { first_cluster };
+            }
         }
+        Ok(result)
+    }
 
+    /// Reads up to `out.len()` bytes of a file whose first cluster
+    /// and size are already known (from `resolve` or `find_in_dir`) --
+    /// decouples "find the file" from "read its data".
+    pub fn read_from(&self, card: &Card, first_cluster: u32, file_size: u32, out: &mut [u8]) -> Result<usize, Fat32Error> {
+        if first_cluster == 0 {
+            return Ok(0);
+        }
         let to_read = (file_size as usize).min(out.len());
         let mut written = 0usize;
         let mut cluster = first_cluster;
@@ -428,4 +470,35 @@ impl Fat32 {
         }
         Ok(written)
     }
+
+    /// Reads a root-directory file's contents into `out`, matched by
+    /// raw 8.3 name (e.g. `b"README  TXT"`, space-padded). Returns
+    /// the byte count actually written (truncated to `out.len()` if
+    /// the file is larger). For files in a subdirectory, use
+    /// `resolve` + `read_from` instead.
+    pub fn read_file(&self, card: &Card, name_8_3: &[u8; 11], out: &mut [u8]) -> Result<usize, Fat32Error> {
+        let (first_cluster, size, _) = self.find_in_dir(card, self.root_cluster, name_8_3)?;
+        self.read_from(card, first_cluster, size, out)
+    }
+}
+
+/// Converts a plain-ASCII path component (e.g. `b"BOOTAA64.EFI"`) into
+/// an 8.3 short name -- uppercased, space-padded, `None` if it
+/// doesn't fit in 8+3 characters.
+fn to_8_3(component: &[u8]) -> Option<[u8; 11]> {
+    let mut name = [b' '; 11];
+    let (base, ext) = match component.iter().position(|&b| b == b'.') {
+        Some(dot) => (&component[..dot], &component[dot + 1..]),
+        None => (component, &[][..]),
+    };
+    if base.is_empty() || base.len() > 8 || ext.len() > 3 {
+        return None;
+    }
+    for (i, &b) in base.iter().enumerate() {
+        name[i] = b.to_ascii_uppercase();
+    }
+    for (i, &b) in ext.iter().enumerate() {
+        name[8 + i] = b.to_ascii_uppercase();
+    }
+    Some(name)
 }

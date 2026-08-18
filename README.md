@@ -304,8 +304,9 @@ milestone 1: core0 -> EL1 -> UART online
   enable) backed by real UEFI variables, not UI-only state.
 - `src/pm.rs` -- BCM2837 power management (watchdog reset).
 - `src/sd.rs` -- SDHCI SD card driver, read+write (see milestone 8's real-vs-emulated caveat).
-- `src/fat32.rs` -- FAT32: mount, list root, read/write a file by name
-  (create, overwrite, grow, shrink -- root directory only).
+- `src/fat32.rs` -- FAT32: mount, list any directory, resolve/read a
+  file at any subdirectory path; write (create, overwrite, grow,
+  shrink) stays root-only.
 - `src/persist.rs` -- variable-store save/load via a real FAT32 file
   (`FERRO.VAR`), auto-triggered on NON_VOLATILE `SetVariable` once a
   card's been mounted this session.
@@ -633,6 +634,38 @@ convention already used everywhere else in this codebase (`persist.rs`,
 bug is invisible until something actually calls deep enough to hit it,
 which a synthetic/minimal test binary may never do.
 
+## Milestone 19 (done): FAT32 subdirectory support
+
+`fat32.rs` could only ever see the root directory. Added:
+- `find_in_dir` -- the shared "search one directory's cluster chain
+  for a name" primitive `resolve_from` and `write_file` both build on
+  (returns first_cluster/size/is_directory, not just a hit/miss).
+- `resolve_from(card, start_cluster, path)` -- walks a `\`-separated
+  path (e.g. `EFI\BOOT\BOOTAA64.EFI`) from any starting directory,
+  descending into subdirectories via each component's own first
+  cluster. `list_root`/`read_file` became thin root-only wrappers
+  around new `list_dir`/generalized `find_in_dir` + `read_from`
+  (reads from an already-known first_cluster/size, decoupled from
+  searching for it).
+- `efi/file_protocol.rs`'s `Open()` now implements real UEFI path
+  semantics: a leading `\` is root-relative regardless of `this`, no
+  leading `\` is relative to `this` (so a directory handle opened via
+  `Open("EFI")` can itself `Open("BOOT")`, `Open("BOOTAA64.EFI")`,
+  etc. -- real recursive traversal, not just one level deep). Opening
+  a path that resolves to a directory returns a new directory handle
+  (listable, walkable) instead of failing.
+- Deliberately still root-only: `write_file`/CREATE. Writing into a
+  subdirectory would need real directory-entry creation logic
+  `write_file`'s root-directory version doesn't share with anything
+  else yet -- Open() honestly returns EFI_WRITE_PROTECTED for
+  WRITE/CREATE against a nested path rather than silently writing to
+  the wrong place.
+
+Verified by extending `efi-test-app` with an `Open("\SUB\NESTED.TXT")`
++ `Read()` step against a real subdirectory (created via `mmd`) on a
+test FAT32 image -- read back the nested file's exact contents through
+two levels of real path resolution, not a synthetic in-memory check.
+
 ## Next milestones
 
 1. Real Pi 3 hardware validation -- nothing here has touched physical
@@ -644,6 +677,6 @@ which a synthetic/minimal test binary may never do.
    model, not a real VideoCore GPU).
 2. Try booting a real, external bootloader (GRUB or systemd-boot for
    aarch64) instead of just the hand-written conformance test --
-   would likely surface gaps around subdirectory support (fat32.rs's
-   biggest remaining limitation) and any protocol those specific
-   projects lean on harder than the test app does.
+   would surface any protocol those specific projects lean on harder
+   than the test app does (subdirectory support, the biggest known
+   gap, is now covered).

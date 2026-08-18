@@ -84,18 +84,21 @@ const MAX_DIR_ENTRIES: usize = 16;
 /// a small table index, not a real pointer.
 struct OpenFile {
     in_use: bool,
-    is_root: bool,
+    /// `Some(cluster)` if this handle is a directory listing that
+    /// cluster (root or any subdirectory reached via `Open`); `None`
+    /// for a plain file.
+    dir_cluster: Option<u32>,
     name_8_3: [u8; 11],
     data: [u8; MAX_FILE_BYTES],
     len: usize,
     pos: usize,
     dirty: bool,
     for_write: bool,
-    // Directory enumeration state (is_root handles only): the root
-    // listing is snapshotted at Open time, and Read() walks it one
-    // entry per call, matching EFI_FILE_PROTOCOL.Read's directory
-    // semantics (each call returns one EFI_FILE_INFO, empty read at
-    // end of directory).
+    // Directory enumeration state (directory handles only, i.e.
+    // dir_cluster.is_some()): the listing is snapshotted at Open time,
+    // and Read() walks it one entry per call, matching
+    // EFI_FILE_PROTOCOL.Read's directory semantics (each call returns
+    // one EFI_FILE_INFO, empty read at end of directory).
     dir_names: [[u8; 11]; MAX_DIR_ENTRIES],
     dir_sizes: [u32; MAX_DIR_ENTRIES],
     dir_count: usize,
@@ -104,7 +107,7 @@ struct OpenFile {
 
 const EMPTY_FILE: OpenFile = OpenFile {
     in_use: false,
-    is_root: false,
+    dir_cluster: None,
     name_8_3: [b' '; 11],
     data: [0; MAX_FILE_BYTES],
     len: 0,
@@ -166,12 +169,11 @@ fn slot_handle(i: usize) -> *mut FileProtocol {
     unsafe { core::ptr::addr_of_mut!(PROTOS[i]) }
 }
 
-/// Converts a CHAR16 path (e.g. "\README.TXT", "README.TXT", "\", or
-/// ".") into an 8.3 name -- None for anything with more than one
-/// path component (subdirectories aren't supported) or a name that
-/// doesn't fit.
-fn char16_path_to_8_3(path: *const u16) -> Option<[u8; 11]> {
-    let mut chars = [0u8; 32];
+/// Converts a CHAR16 path into raw ASCII bytes (non-ASCII chars
+/// become `?`), preserving `\` separators -- unlike an 8.3-name
+/// converter, this doesn't reject multi-component paths, since
+/// `fs.resolve_from` is what walks those.
+fn char16_path_to_ascii(path: *const u16, out: &mut [u8; 128]) -> Option<usize> {
     let mut n = 0;
     let mut i = 0isize;
     loop {
@@ -180,38 +182,13 @@ fn char16_path_to_8_3(path: *const u16) -> Option<[u8; 11]> {
             break;
         }
         i += 1;
-        if n >= chars.len() {
+        if n >= out.len() {
             return None;
         }
-        chars[n] = if c < 128 { c as u8 } else { b'?' };
+        out[n] = if c < 128 { c as u8 } else { b'?' };
         n += 1;
     }
-    let mut s = &chars[..n];
-    if !s.is_empty() && s[0] == b'\\' {
-        s = &s[1..];
-    }
-    if s.is_empty() || s == b"." {
-        return None; // caller handles "root" specially before this
-    }
-    if s.contains(&b'\\') {
-        return None; // subdirectory path -- unsupported
-    }
-
-    let mut name = [b' '; 11];
-    let (base, ext) = match s.iter().position(|&b| b == b'.') {
-        Some(dot) => (&s[..dot], &s[dot + 1..]),
-        None => (s, &[][..]),
-    };
-    if base.is_empty() || base.len() > 8 || ext.len() > 3 {
-        return None;
-    }
-    for (i, &b) in base.iter().enumerate() {
-        name[i] = b.to_ascii_uppercase();
-    }
-    for (i, &b) in ext.iter().enumerate() {
-        name[8 + i] = b.to_ascii_uppercase();
-    }
-    Some(name)
+    Some(n)
 }
 
 fn is_root_path(path: *const u16) -> bool {
@@ -226,13 +203,13 @@ fn is_root_path(path: *const u16) -> bool {
     c0 == b'.' as u16 && unsafe { *path.offset(1) } == 0
 }
 
-fn open_root(card: &Card, fs: &Fat32) -> Option<usize> {
+fn open_dir(card: &Card, fs: &Fat32, dir_cluster: u32) -> Option<usize> {
     let i = alloc_slot()?;
     let files = unsafe { &mut *core::ptr::addr_of_mut!(FILES) };
-    files[i].is_root = true;
+    files[i].dir_cluster = Some(dir_cluster);
     let mut names = [[0u8; 11]; MAX_DIR_ENTRIES];
     let mut sizes = [0u32; MAX_DIR_ENTRIES];
-    let count = fs.list_root(card, &mut names, &mut sizes).unwrap_or(0);
+    let count = fs.list_dir(card, dir_cluster, &mut names, &mut sizes).unwrap_or(0);
     files[i].dir_names = names;
     files[i].dir_sizes = sizes;
     files[i].dir_count = count;
@@ -247,12 +224,19 @@ extern "C" fn open_volume(_this: *mut SimpleFileSystemProtocol, root: *mut *mut 
     let Some((card, fs)) = crate::persist::get_context() else {
         return EFI_NOT_FOUND;
     };
-    let Some(i) = open_root(&card, &fs) else {
+    let Some(i) = open_dir(&card, &fs, fs.root_cluster()) else {
         return EFI_OUT_OF_RESOURCES;
     };
     unsafe { *root = slot_handle(i) };
     EFI_SUCCESS
 }
+
+/// Static, not stack-allocated: MAX_FILE_BYTES is 64KiB, and this
+/// runs deep in a call chain (loaded EFI app -> this function
+/// pointer) against Ferro's own 64KiB boot stack -- a stack-local
+/// buffer this size here silently overflows it (a real bug this
+/// implementation had and fixed, see the README).
+static mut OPEN_SCRATCH: [u8; MAX_FILE_BYTES] = [0; MAX_FILE_BYTES];
 
 extern "C" fn file_open(
     this: *mut FileProtocol,
@@ -267,57 +251,129 @@ extern "C" fn file_open(
     let Some(parent) = this_to_index(this) else {
         return EFI_INVALID_PARAMETER;
     };
-    if !unsafe { (*core::ptr::addr_of!(FILES))[parent].is_root } {
-        return EFI_UNSUPPORTED; // only root-relative opens are supported
-    }
+    let Some(parent_dir_cluster) = (unsafe { (*core::ptr::addr_of!(FILES))[parent].dir_cluster }) else {
+        return EFI_UNSUPPORTED; // opening "relative to" a plain file makes no sense
+    };
     let Some((card, fs)) = crate::persist::get_context() else {
         return EFI_NOT_FOUND;
     };
 
     if is_root_path(file_name) {
-        let Some(i) = open_root(&card, &fs) else {
+        let Some(i) = open_dir(&card, &fs, parent_dir_cluster) else {
             return EFI_OUT_OF_RESOURCES;
         };
         unsafe { *new_handle = slot_handle(i) };
         return EFI_SUCCESS;
     }
 
-    let Some(name) = char16_path_to_8_3(file_name) else {
+    let mut ascii = [0u8; 128];
+    let Some(n) = char16_path_to_ascii(file_name, &mut ascii) else {
         return EFI_NOT_FOUND;
     };
+    let raw = &ascii[..n];
+    // A leading `\` means "relative to the volume root" regardless of
+    // `this`, per spec; otherwise it's relative to `this`.
+    let (start_cluster, path) = if raw.first() == Some(&b'\\') {
+        (fs.root_cluster(), &raw[1..])
+    } else {
+        (parent_dir_cluster, raw)
+    };
+    let single_component = !path.contains(&b'\\');
 
-    // Static, not stack-allocated: MAX_FILE_BYTES is 64KiB, and this
-    // runs deep in a call chain (loaded EFI app -> this function
-    // pointer) against Ferro's own 64KiB boot stack -- a stack-local
-    // buffer this size here silently overflows it.
-    static mut OPEN_SCRATCH: [u8; MAX_FILE_BYTES] = [0; MAX_FILE_BYTES];
-    let buf = unsafe { &mut *core::ptr::addr_of_mut!(OPEN_SCRATCH) };
-    let read = fs.read_file(&card, &name, buf);
-
-    let len = match read {
-        Ok(n) => n,
-        Err(_) if open_mode & EFI_FILE_MODE_CREATE != 0 => {
-            if fs.write_file(&card, &name, &[]).is_err() {
-                return EFI_UNSUPPORTED;
+    // The original root-file create/overwrite path (unchanged
+    // behavior, including CREATE support) -- kept exactly for
+    // single-component names directly under the root, which is all
+    // FERRO.VAR persistence and every existing caller ever needed.
+    if single_component && start_cluster == fs.root_cluster() {
+        let Some(name) = to_8_3_or_none(path) else {
+            return EFI_NOT_FOUND;
+        };
+        let buf = unsafe { &mut *core::ptr::addr_of_mut!(OPEN_SCRATCH) };
+        let len = match fs.read_file(&card, &name, buf) {
+            Ok(n) => n,
+            Err(_) if open_mode & EFI_FILE_MODE_CREATE != 0 => {
+                if fs.write_file(&card, &name, &[]).is_err() {
+                    return EFI_UNSUPPORTED;
+                }
+                0
             }
-            0
-        }
+            Err(_) => return EFI_NOT_FOUND,
+        };
+
+        let Some(i) = alloc_slot() else {
+            return EFI_OUT_OF_RESOURCES;
+        };
+        let files = unsafe { &mut *core::ptr::addr_of_mut!(FILES) };
+        files[i].name_8_3 = name;
+        files[i].data[..len].copy_from_slice(&buf[..len]);
+        files[i].len = len;
+        files[i].pos = 0;
+        files[i].for_write = open_mode & EFI_FILE_MODE_WRITE != 0;
+        files[i].dirty = false;
+
+        unsafe { *new_handle = slot_handle(i) };
+        return EFI_SUCCESS;
+    }
+
+    // Any other path (a subdirectory, or a multi-component path even
+    // under the root) -- real traversal via resolve_from, read-only:
+    // write_file has no subdirectory support, so honestly reject
+    // CREATE/WRITE here instead of silently writing to the wrong
+    // place.
+    if open_mode & (EFI_FILE_MODE_WRITE | EFI_FILE_MODE_CREATE) != 0 {
+        return super::types::EFI_WRITE_PROTECTED;
+    }
+    let Ok((first_cluster, size, is_dir)) = fs.resolve_from(&card, start_cluster, path) else {
+        return EFI_NOT_FOUND;
+    };
+    if is_dir {
+        let Some(i) = open_dir(&card, &fs, if first_cluster == 0 { fs.root_cluster() } else { first_cluster }) else {
+            return EFI_OUT_OF_RESOURCES;
+        };
+        unsafe { *new_handle = slot_handle(i) };
+        return EFI_SUCCESS;
+    }
+
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(OPEN_SCRATCH) };
+    let len = match fs.read_from(&card, first_cluster, size, buf) {
+        Ok(n) => n,
         Err(_) => return EFI_NOT_FOUND,
     };
-
     let Some(i) = alloc_slot() else {
         return EFI_OUT_OF_RESOURCES;
     };
     let files = unsafe { &mut *core::ptr::addr_of_mut!(FILES) };
-    files[i].name_8_3 = name;
+    // Only used to label GetInfo's FileName / a Close-time write-back
+    // that never triggers here (for_write stays false) -- doesn't
+    // need to be a real 8.3 name for a nested file, just something to
+    // show.
+    files[i].name_8_3 = path.rsplit(|&b| b == b'\\').next().and_then(to_8_3_or_none).unwrap_or([b' '; 11]);
     files[i].data[..len].copy_from_slice(&buf[..len]);
     files[i].len = len;
     files[i].pos = 0;
-    files[i].for_write = open_mode & EFI_FILE_MODE_WRITE != 0;
+    files[i].for_write = false;
     files[i].dirty = false;
 
     unsafe { *new_handle = slot_handle(i) };
     EFI_SUCCESS
+}
+
+fn to_8_3_or_none(component: &[u8]) -> Option<[u8; 11]> {
+    let mut name = [b' '; 11];
+    let (base, ext) = match component.iter().position(|&b| b == b'.') {
+        Some(dot) => (&component[..dot], &component[dot + 1..]),
+        None => (component, &[][..]),
+    };
+    if base.is_empty() || base.len() > 8 || ext.len() > 3 {
+        return None;
+    }
+    for (i, &b) in base.iter().enumerate() {
+        name[i] = b.to_ascii_uppercase();
+    }
+    for (i, &b) in ext.iter().enumerate() {
+        name[8 + i] = b.to_ascii_uppercase();
+    }
+    Some(name)
 }
 
 fn flush_if_dirty(i: usize) {
@@ -359,7 +415,7 @@ extern "C" fn file_read(this: *mut FileProtocol, buffer_size: *mut usize, buffer
     };
     let files = unsafe { &mut *core::ptr::addr_of_mut!(FILES) };
 
-    if files[i].is_root {
+    if files[i].dir_cluster.is_some() {
         if files[i].dir_index >= files[i].dir_count {
             unsafe { *buffer_size = 0 };
             return EFI_SUCCESS; // end of directory
@@ -400,7 +456,7 @@ extern "C" fn file_write(this: *mut FileProtocol, buffer_size: *mut usize, buffe
         return EFI_INVALID_PARAMETER;
     };
     let files = unsafe { &mut *core::ptr::addr_of_mut!(FILES) };
-    if files[i].is_root {
+    if files[i].dir_cluster.is_some() {
         return EFI_UNSUPPORTED;
     }
     if !files[i].for_write {
@@ -434,7 +490,7 @@ extern "C" fn file_set_position(this: *mut FileProtocol, position: u64) -> EfiSt
         return EFI_INVALID_PARAMETER;
     };
     let files = unsafe { &mut *core::ptr::addr_of_mut!(FILES) };
-    if files[i].is_root {
+    if files[i].dir_cluster.is_some() {
         if position == 0 {
             files[i].dir_index = 0;
             return EFI_SUCCESS;
@@ -515,7 +571,7 @@ extern "C" fn file_get_info(
         return EFI_UNSUPPORTED;
     }
     let files = unsafe { &*core::ptr::addr_of!(FILES) };
-    let (name, size, is_dir) = (files[i].name_8_3, files[i].len as u64, files[i].is_root);
+    let (name, size, is_dir) = (files[i].name_8_3, files[i].len as u64, files[i].dir_cluster.is_some());
     match write_file_info(buffer, unsafe { *buffer_size }, &name, size, is_dir) {
         Ok(written) => {
             unsafe { *buffer_size = written };

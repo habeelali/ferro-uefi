@@ -201,6 +201,11 @@ const TEST_FILE_NAME: [u16; 9] = [
     'T' as u16, 'E' as u16, 'S' as u16, 'T' as u16, '.' as u16, 'T' as u16, 'X' as u16, 'T' as u16, 0,
 ];
 
+const NESTED_FILE_PATH: [u16; 16] = [
+    '\\' as u16, 'S' as u16, 'U' as u16, 'B' as u16, '\\' as u16, 'N' as u16, 'E' as u16, 'S' as u16, 'T' as u16,
+    'E' as u16, 'D' as u16, '.' as u16, 'T' as u16, 'X' as u16, 'T' as u16, 0,
+];
+
 #[no_mangle]
 extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut SystemTable) -> Status {
     let st = unsafe { &*system_table };
@@ -265,10 +270,40 @@ extern "efiapi" fn efi_main(_image_handle: Handle, system_table: *mut SystemTabl
                 }
                 (unsafe { &*file }.close)(file);
             }
+
+            print(st, "[6] Open(\"\\SUB\\NESTED.TXT\") -- subdirectory traversal... ");
+            let mut nested: *mut FileProtocol = core::ptr::null_mut();
+            let status = (unsafe { &*root }.open)(root, &mut nested, NESTED_FILE_PATH.as_ptr(), 1, 0);
+            if status != EFI_SUCCESS || nested.is_null() {
+                print(st, "FAILED (status=");
+                print_decimal(st, status as u64);
+                print(st, ") -- expected if SUB\\NESTED.TXT wasn't placed on the card\r\n");
+            } else {
+                print(st, "OK\r\n");
+                print(st, "[7] Read() the nested file... ");
+                let mut buf = [0u8; 128];
+                let mut size = buf.len();
+                let status = (unsafe { &*nested }.read)(nested, &mut size, buf.as_mut_ptr() as *mut c_void);
+                if status != EFI_SUCCESS {
+                    print(st, "FAILED\r\n");
+                } else {
+                    print(st, "OK, read ");
+                    print_decimal(st, size as u64);
+                    print(st, " bytes: \"");
+                    let mut u16buf = [0u16; 129];
+                    for i in 0..size {
+                        u16buf[i] = buf[i] as u16;
+                    }
+                    u16buf[size] = 0;
+                    (unsafe { &*st.con_out }.output_string)(st.con_out, u16buf.as_ptr());
+                    print(st, "\"\r\n");
+                }
+                (unsafe { &*nested }.close)(nested);
+            }
         }
     }
 
-    print(st, "\r\n[6] Waiting for a keypress via ConIn.ReadKeyStroke...\r\n");
+    print(st, "\r\n[8] Waiting for a keypress via ConIn.ReadKeyStroke...\r\n");
     let mut key = InputKey { scan_code: 0, unicode_char: 0 };
     loop {
         let status = (unsafe { &*st.con_in }.read_key_stroke)(st.con_in, &mut key);
