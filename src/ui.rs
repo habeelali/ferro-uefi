@@ -591,12 +591,22 @@ pub fn run(fb: &Framebuffer, uart: &mut Uart) -> ! {
     let mut state = MenuState { selected: 0 };
     draw_menu(fb, &state);
 
-    let mut keyboard = crate::usb::init()
-        .ok()
-        .and_then(|speed| crate::hid::find_keyboard(speed).ok());
-    if keyboard.is_some() {
-        writeln!(uart, "\n[menu] USB HID keyboard connected").ok();
-    }
+    let mut keyboard = match crate::usb::init() {
+        Ok(speed) => match crate::hid::find_keyboard(speed) {
+            Ok(kbd) => {
+                writeln!(uart, "\n[menu] USB HID keyboard connected").ok();
+                Some(kbd)
+            }
+            Err(e) => {
+                writeln!(uart, "\n[menu] no USB HID keyboard found ({e:?}) -- UART input only").ok();
+                None
+            }
+        },
+        Err(e) => {
+            writeln!(uart, "\n[menu] USB init failed ({e:?}) -- UART input only").ok();
+            None
+        }
+    };
 
     let mut input = InputState { esc: 0 };
     loop {

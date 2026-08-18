@@ -54,7 +54,7 @@ pub fn find_keyboard(root_speed: Speed) -> Result<Keyboard, HidError> {
         let num_ports = hub_desc[2];
 
         for port in 1..=num_ports as u16 {
-            if let Some(speed) = usb::hub_power_and_reset_port(&hub, port)? {
+            if let Ok(Some(speed)) = usb::hub_power_and_reset_port(&hub, port) {
                 if let Ok(kbd) = enumerate_as_keyboard(speed, 2) {
                     return Ok(kbd);
                 }
