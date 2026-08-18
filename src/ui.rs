@@ -891,7 +891,7 @@ fn save_variables_to_sd(fb: &Framebuffer, uart: &mut Uart, keyboard: &mut Option
 
     match crate::persist::save(&card, &fs) {
         Ok(bytes) => {
-            writeln!(uart, "  wrote {bytes} bytes to the reserved-sector scratch region").ok();
+            writeln!(uart, "  wrote {bytes} bytes to FERRO.VAR in the root directory").ok();
             print_lines(
                 fb,
                 uart,

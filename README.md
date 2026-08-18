@@ -304,8 +304,11 @@ milestone 1: core0 -> EL1 -> UART online
   enable) backed by real UEFI variables, not UI-only state.
 - `src/pm.rs` -- BCM2837 power management (watchdog reset).
 - `src/sd.rs` -- SDHCI SD card driver, read+write (see milestone 8's real-vs-emulated caveat).
-- `src/fat32.rs` -- read-only FAT32: mount, list root, read file by name.
-- `src/persist.rs` -- variable-store save/load via FAT32's unused reserved sectors.
+- `src/fat32.rs` -- FAT32: mount, list root, read/write a file by name
+  (create, overwrite, grow, shrink -- root directory only).
+- `src/persist.rs` -- variable-store save/load via a real FAT32 file
+  (`FERRO.VAR`), auto-triggered on NON_VOLATILE `SetVariable` once a
+  card's been mounted this session.
 - `src/pe.rs` -- PE32+ (AArch64) loader: parse, load, base-relocate.
 - `src/usb.rs` -- DWC2 USB host controller driver (DMA-mode control transfers).
 - `src/hid.rs` -- USB hub traversal + HID boot-protocol keyboard enumeration/polling.
@@ -497,16 +500,49 @@ accent theme in SETTINGS *without* ever pressing SAVE VARIABLES TO
 SD, then cold-restart QEMU against the same disk image and BOOT FROM
 SD again -- the SETTINGS screen still shows the changed theme.
 
-Still backed by the reserved-sector scratch region, not real files --
-see the next milestone.
+At the time this was written, still backed by the reserved-sector
+scratch region rather than a real file -- fixed immediately after in
+milestone 17.
+
+## Milestone 17 (done): real FAT32 write support
+
+Replaced the reserved-sector scratch-region hack with an actual file:
+`persist.rs` now saves to and loads from `FERRO.VAR` in the volume's
+root directory via new write support in `fat32.rs` -- an ordinary
+file any other FAT32 implementation (including the host machine's,
+via `mtools`) can see and read, not a private corner of the disk only
+Ferro understands.
+
+`Fat32::write_file` handles the full create/overwrite/grow/shrink
+cycle: FAT entry read-modify-write mirrored across every FAT copy,
+free-cluster scanning, chain allocation, chain truncation (freeing
+the tail when a file shrinks) and extension (when it grows), and
+extending the root directory itself with a new cluster if every
+existing entry slot is taken. `SdError`/`Fat32Error` -> `PersistError`
+conversions replaced the old scratch-region-specific error handling.
+
+Verified against a real 64 MiB FAT32 image with `mtools` from the
+host side, not just by reading it back through Ferro's own driver
+(which could hide a bug both sides shared):
+- A single-cluster save (four UEFI variables, 215 bytes) produced a
+  `FERRO.VAR` `mdir`/`mtype` shows as a normal 215-byte file, sitting
+  correctly alongside a pre-existing `HELLO.TXT` the image already
+  had -- proving directory-entry creation doesn't disturb unrelated
+  files.
+- A forced multi-cluster save (two temporary 300-byte dummy
+  variables, since this project's variables cap at 512 bytes each and
+  the test image's cluster size is also 512 bytes) produced a
+  736-byte, 2-cluster file that `mtype` reads back byte-for-byte
+  correct -- proving the FAT chain linking across the cluster boundary
+  is right, not just single-cluster writes.
+- Re-saving with a different byte count (settings changes growing the
+  variable store across several autosave calls, 64 -> 215 bytes in
+  one session) exercised the existing-file resize path, not just
+  first-time creation.
 
 ## Next milestones
 
-1. Real FAT32 write support, so persisted variables live in an actual
-   file instead of a private, non-standard corner of the reserved
-   sectors -- the scratch-region approach works but isn't something
-   another OS's FAT32 driver would ever look at or understand.
-2. Real Pi 3 hardware validation -- nothing here has touched physical
+1. Real Pi 3 hardware validation -- nothing here has touched physical
    hardware yet, and there are three known gaps waiting there: the
    pm.rs reset sequence (right code, unverified effect), sd.rs's
    controller choice (right controller for QEMU, wrong one for the

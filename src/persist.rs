@@ -1,26 +1,26 @@
-//! Cross-reboot persistence for the UEFI variable store, backed by raw
-//! SD card sectors -- not a real file, since there's no FAT32 write
-//! support. It lives in the reserved area's normally-unused padding
-//! sectors (see Fat32::private_scratch_region), sectors real FAT32
-//! implementations never touch, so this doesn't risk the filesystem.
+//! Cross-reboot persistence for the UEFI variable store, backed by a
+//! real file (`FERRO.VAR`) in the volume's root directory via
+//! `Fat32::write_file`/`read_file` -- an ordinary file any other
+//! FAT32 implementation can see and understand, not a private corner
+//! of the reserved sectors.
 
 use crate::efi::variables;
-use crate::fat32::Fat32;
+use crate::fat32::{Fat32, Fat32Error};
 use crate::sd::{Card, SdError};
 
-const SECTOR_SIZE: usize = 512;
-const MAX_SECTORS: usize = 16; // matches the realistic scratch-region size (see fat32.rs)
+const VAR_FILE_NAME: [u8; 11] = *b"FERRO   VAR";
+const MAX_BYTES: usize = 8192;
 
-// Static, not stack-allocated: this is a big buffer (8 KiB) relative
-// to the 64 KiB boot stack, and save/load run several call frames deep
-// from the menu.
-static mut BUF: [u8; MAX_SECTORS * SECTOR_SIZE] = [0; MAX_SECTORS * SECTOR_SIZE];
+// Static, not stack-allocated: this is a big buffer relative to the
+// 64 KiB boot stack, and save/load run several call frames deep from
+// the menu.
+static mut BUF: [u8; MAX_BYTES] = [0; MAX_BYTES];
 
 #[derive(Debug)]
 pub enum PersistError {
-    NoScratchRegion,
     TooLarge,
     Sd(#[allow(dead_code)] SdError),
+    Fat32(#[allow(dead_code)] Fat32Error),
     NotOurData,
 }
 
@@ -30,23 +30,18 @@ impl From<SdError> for PersistError {
     }
 }
 
-/// Serializes the current variable store and writes it into the
-/// volume's private scratch region.
-pub fn save(card: &Card, fs: &Fat32) -> Result<usize, PersistError> {
-    let (start_lba, sector_count) = fs.private_scratch_region().ok_or(PersistError::NoScratchRegion)?;
-
-    let buf = unsafe { &mut *core::ptr::addr_of_mut!(BUF) };
-    let capacity = (sector_count as usize * SECTOR_SIZE).min(buf.len());
-    let written = variables::serialize(&mut buf[..capacity]).ok_or(PersistError::TooLarge)?;
-
-    let sectors_needed = (written + SECTOR_SIZE - 1) / SECTOR_SIZE;
-    for i in 0..sectors_needed {
-        let mut sector = [0u8; SECTOR_SIZE];
-        let off = i * SECTOR_SIZE;
-        let len = (written - off).min(SECTOR_SIZE);
-        sector[..len].copy_from_slice(&buf[off..off + len]);
-        card.write_block(start_lba + i as u32, &sector)?;
+impl From<Fat32Error> for PersistError {
+    fn from(e: Fat32Error) -> Self {
+        PersistError::Fat32(e)
     }
+}
+
+/// Serializes the current variable store and writes it to FERRO.VAR
+/// in the volume's root directory.
+pub fn save(card: &Card, fs: &Fat32) -> Result<usize, PersistError> {
+    let buf = unsafe { &mut *core::ptr::addr_of_mut!(BUF) };
+    let written = variables::serialize(buf).ok_or(PersistError::TooLarge)?;
+    fs.write_file(card, &VAR_FILE_NAME, &buf[..written])?;
     Ok(written)
 }
 
@@ -75,21 +70,12 @@ pub fn autosave() -> Option<Result<usize, PersistError>> {
     ctx.map(|(card, fs)| save(&card, &fs))
 }
 
-/// Reads the volume's private scratch region and merges any
+/// Reads FERRO.VAR from the volume's root directory and merges any
 /// previously-saved variables into the live store. Returns the number
-/// loaded, or NotOurData if the region doesn't start with our magic
-/// (nothing saved yet, or it's someone else's data).
+/// loaded, or NotOurData if the file doesn't exist yet or doesn't
+/// start with our magic.
 pub fn load(card: &Card, fs: &Fat32) -> Result<usize, PersistError> {
-    let (start_lba, sector_count) = fs.private_scratch_region().ok_or(PersistError::NoScratchRegion)?;
-
     let buf = unsafe { &mut *core::ptr::addr_of_mut!(BUF) };
-    let capacity_sectors = sector_count.min((buf.len() / SECTOR_SIZE) as u32);
-    for i in 0..capacity_sectors {
-        let mut sector = [0u8; SECTOR_SIZE];
-        card.read_block(start_lba + i, &mut sector)?;
-        let off = i as usize * SECTOR_SIZE;
-        buf[off..off + SECTOR_SIZE].copy_from_slice(&sector);
-    }
-
-    variables::deserialize(&buf[..(capacity_sectors as usize * SECTOR_SIZE)]).ok_or(PersistError::NotOurData)
+    let n = fs.read_file(card, &VAR_FILE_NAME, buf)?;
+    variables::deserialize(&buf[..n]).ok_or(PersistError::NotOurData)
 }
