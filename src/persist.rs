@@ -50,6 +50,31 @@ pub fn save(card: &Card, fs: &Fat32) -> Result<usize, PersistError> {
     Ok(written)
 }
 
+/// A card/filesystem the menu already successfully mounted this
+/// session, cached so `SetVariable(..., NON_VOLATILE, ...)` can
+/// auto-persist without re-running SD init + FAT32 mount on every
+/// single call. Set by `set_context` once BOOT FROM SD or SAVE
+/// VARIABLES TO SD has mounted a card; `Card`/`Fat32` are small,
+/// `Copy` handles (register state + geometry), not open file handles,
+/// so caching them is cheap and safe.
+static mut SD_CONTEXT: Option<(Card, Fat32)> = None;
+
+pub fn set_context(card: Card, fs: Fat32) {
+    unsafe { *core::ptr::addr_of_mut!(SD_CONTEXT) = Some((card, fs)) };
+}
+
+/// Best-effort auto-save of the live variable store, used right after
+/// a NON_VOLATILE SetVariable call. Does nothing (silently) if no SD
+/// context has been established yet this session -- this is a
+/// convenience for "I already mounted a card, keep it in sync", not a
+/// replacement for the explicit SAVE VARIABLES TO SD menu item, which
+/// remains the only way to get a first write on a session that never
+/// otherwise touched the SD card.
+pub fn autosave() -> Option<Result<usize, PersistError>> {
+    let ctx = unsafe { *core::ptr::addr_of!(SD_CONTEXT) };
+    ctx.map(|(card, fs)| save(&card, &fs))
+}
+
 /// Reads the volume's private scratch region and merges any
 /// previously-saved variables into the live store. Returns the number
 /// loaded, or NotOurData if the region doesn't start with our magic

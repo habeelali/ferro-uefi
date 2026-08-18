@@ -477,12 +477,35 @@ system data. This pass:
   rendered as blank squares (e.g. "WHAT'S ON IT", "(FULL TEXT OVER
   UART)").
 
+## Milestone 16 (done): automatic NON_VOLATILE variable persistence
+
+`SetVariable` with the `EFI_VARIABLE_NON_VOLATILE` attribute now
+actually persists immediately, not only when the user explicitly picks
+SAVE VARIABLES TO SD. `persist.rs` caches the `Card`/`Fat32` handle
+(both small, `Copy`, register-state-plus-geometry structs -- cheap to
+stash, not open file handles) the first time either BOOT FROM SD or
+SAVE VARIABLES TO SD successfully mounts a card; from then on, any
+NON_VOLATILE `SetVariable` call -- through the real EFI_RUNTIME_SERVICES
+table or from the SETTINGS screen -- triggers a background save
+through that cached context. If no card has been mounted yet this
+session, it's a silent no-op (there's nothing to write through), so
+the explicit menu item is still what gets the *first* write on a
+session that never otherwise touched the SD card.
+
+Verified end to end: BOOT FROM SD to establish a mount, change the
+accent theme in SETTINGS *without* ever pressing SAVE VARIABLES TO
+SD, then cold-restart QEMU against the same disk image and BOOT FROM
+SD again -- the SETTINGS screen still shows the changed theme.
+
+Still backed by the reserved-sector scratch region, not real files --
+see the next milestone.
+
 ## Next milestones
 
-1. Automatic variable persistence (save on `SetVariable` with the
-   NON_VOLATILE attribute, rather than only via the explicit menu
-   item) and FAT32 write support, so saved state doesn't depend on a
-   private, non-standard corner of the reserved sectors.
+1. Real FAT32 write support, so persisted variables live in an actual
+   file instead of a private, non-standard corner of the reserved
+   sectors -- the scratch-region approach works but isn't something
+   another OS's FAT32 driver would ever look at or understand.
 2. Real Pi 3 hardware validation -- nothing here has touched physical
    hardware yet, and there are three known gaps waiting there: the
    pm.rs reset sequence (right code, unverified effect), sd.rs's

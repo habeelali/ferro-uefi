@@ -159,6 +159,7 @@ fn send_command(index: u8, arg: u32, resp: RespType, data: DataDir) -> Result<[u
     })
 }
 
+#[derive(Clone, Copy)]
 pub struct Card {
     #[allow(dead_code)] // kept for future re-select/status use, not needed by read_block
     rca: u32,

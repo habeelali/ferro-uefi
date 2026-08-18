@@ -24,6 +24,7 @@ impl From<SdError> for Fat32Error {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct Fat32 {
     partition_start_lba: u32,
     sectors_per_cluster: u8,

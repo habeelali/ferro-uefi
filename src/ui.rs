@@ -664,6 +664,7 @@ fn boot_from_sd(fb: &Framebuffer, uart: &mut Uart, keyboard: &mut Option<Keyboar
         }
     };
     let mut y = print_lines(fb, uart, CONTENT_X, y, 2, FG, &["FAT32 VOLUME MOUNTED."]);
+    crate::persist::set_context(card, fs);
 
     match crate::persist::load(&card, &fs) {
         Ok(n) => {
@@ -886,6 +887,7 @@ fn save_variables_to_sd(fb: &Framebuffer, uart: &mut Uart, keyboard: &mut Option
         }
     };
     let y = print_lines(fb, uart, CONTENT_X, y, 2, FG, &["FAT32 VOLUME MOUNTED."]);
+    crate::persist::set_context(card, fs);
 
     match crate::persist::save(&card, &fs) {
         Ok(bytes) => {

@@ -13,6 +13,8 @@ use super::variables::{self, VarError};
 use core::ffi::c_void;
 use core::sync::atomic::{AtomicU32, Ordering};
 
+const EFI_VARIABLE_NON_VOLATILE: u32 = 0x0000_0001;
+
 #[repr(C)]
 pub struct EfiTime {
     pub year: u16,
@@ -169,7 +171,16 @@ extern "C" fn set_variable(
     };
 
     match variables::set(variable_name, &guid, attributes, buf) {
-        Ok(()) => EFI_SUCCESS,
+        Ok(()) => {
+            // Real cross-reboot persistence for NON_VOLATILE variables,
+            // not just on the explicit "SAVE VARIABLES TO SD" menu
+            // item -- best-effort: does nothing if no SD card has been
+            // mounted yet this session (see persist::autosave).
+            if attributes & EFI_VARIABLE_NON_VOLATILE != 0 {
+                crate::persist::autosave();
+            }
+            EFI_SUCCESS
+        }
         Err(VarError::NotFound) => EFI_NOT_FOUND,
         Err(VarError::InvalidParameter) => EFI_INVALID_PARAMETER,
         Err(VarError::OutOfResources) => EFI_OUT_OF_RESOURCES,

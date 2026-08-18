@@ -125,6 +125,10 @@ fn set_bool(name: &str, value: bool) {
     let ptr = name_units(name, &mut nbuf);
     let data = [value as u8];
     variables::set(ptr, &FERRO_SETTINGS_GUID, ATTR, &data).ok();
+    // ATTR always includes NON_VOLATILE -- keep any already-mounted SD
+    // card in sync immediately, same as a real SetVariable call would
+    // (see efi::runtime_services::set_variable).
+    crate::persist::autosave();
 }
 
 fn get_byte(name: &str, default: u8) -> u8 {
@@ -142,6 +146,7 @@ fn set_byte(name: &str, value: u8) {
     let ptr = name_units(name, &mut nbuf);
     let data = [value];
     variables::set(ptr, &FERRO_SETTINGS_GUID, ATTR, &data).ok();
+    crate::persist::autosave();
 }
 
 /// Loads settings from the live variable store (already populated by
