@@ -56,10 +56,12 @@ const CONTENT_Y: u32 = HEADER_H + 35;
 /// at full speed, still line by line rather than all at once.
 const LINE_DELAY_TICKS: u64 = 6;
 
-/// Ticks between idle redraws of the boot manager screen, so the
-/// status panel's uptime/live fields keep moving even when nothing's
-/// being pressed.
-const IDLE_REDRAW_TICKS: u64 = 100;
+/// Ticks between idle redraws of the boot manager's UPTIME line, so
+/// it keeps counting even when nothing's being pressed. Only that one
+/// line gets touched (see refresh_uptime), so this can run often
+/// without being visually disruptive -- 10 ticks (~100ms) gives a
+/// smoothly counting tenths digit instead of jumping by whole seconds.
+const IDLE_REDRAW_TICKS: u64 = 10;
 
 fn text_width(text: &str, scale: u32) -> u32 {
     text.chars().count() as u32 * (GLYPH_WIDTH + 1) * scale
@@ -284,6 +286,32 @@ fn draw_status_panel(fb: &Framebuffer, keyboard: &Option<Keyboard>) {
     let mut lb = LineBuf::new();
     write!(lb, "NVRAM    {used}/{max} BYTES").ok();
     fb.draw_text(x, y, lb.as_str(), 2, FG);
+}
+
+/// y-coordinate of the status panel's UPTIME line -- the one field
+/// that changes every idle tick -- kept in sync with draw_status_panel
+/// (heading, then a gap, then this line first).
+fn uptime_line_y() -> u32 {
+    CONTENT_Y + line_height(2) + 6
+}
+
+/// Redraws just the UPTIME line's text, not the whole screen -- used
+/// for the once-a-second idle refresh. A full-screen clear+redraw on
+/// every tick is visibly a flash on real hardware/QEMU display
+/// output, since there's no double buffering here: whatever's written
+/// to the framebuffer is immediately what the GPU scans out. Touching
+/// only the few characters that actually change keeps that
+/// imperceptible instead of a once-a-second flicker.
+fn refresh_uptime(fb: &Framebuffer) {
+    let y = uptime_line_y();
+    let w = fb.width - MARGIN - STATUS_X;
+    fb.fill_rect(STATUS_X, y, w, line_height(2), BG);
+
+    let ticks = timer::ticks();
+    let mut lb = LineBuf::new();
+    write!(lb, "UPTIME   {}.{}S", ticks / 100, (ticks % 100) / 10).ok();
+    fb.draw_text(STATUS_X, y, lb.as_str(), 2, FG);
+    fb.flush();
 }
 
 fn draw_menu(fb: &Framebuffer, s: &MenuState, keyboard: &Option<Keyboard>) {
@@ -983,7 +1011,7 @@ pub fn run(fb: &Framebuffer, uart: &mut Uart) -> ! {
         }
 
         if timer::ticks().wrapping_sub(last_draw) >= IDLE_REDRAW_TICKS {
-            draw_menu(fb, &state, &keyboard);
+            refresh_uptime(fb);
             last_draw = timer::ticks();
         }
     }
